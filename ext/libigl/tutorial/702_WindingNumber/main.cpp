@@ -2,14 +2,12 @@
 #include <igl/boundary_facets.h>
 #include <igl/parula.h>
 #include <igl/readMESH.h>
-#include <igl/slice.h>
-#include <igl/slice_tets.h>
+#include <igl/marching_tets.h>
 #include <igl/winding_number.h>
 #include <igl/opengl/glfw/Viewer.h>
 #include <Eigen/Sparse>
 #include <iostream>
 
-#include "tutorial_shared_path.h"
 
 Eigen::MatrixXd V,BC;
 Eigen::VectorXd W;
@@ -40,10 +38,9 @@ void update_visualization(igl::opengl::glfw::Viewer & viewer)
         V.col(1)*plane(1) + 
         V.col(2)*plane(2)).array()
       + plane(3);
-    igl::slice_tets(V,T,IV,V_vis,F_vis,J,bary);
+    igl::marching_tets(V,T,IV,V_vis,F_vis,J,bary);
   }
-  VectorXd W_vis;
-  igl::slice(W,J,W_vis);
+  VectorXd W_vis = W(J);
   MatrixXd C_vis;
   // color without normalizing
   igl::parula(W_vis,false,C_vis);

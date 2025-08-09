@@ -116,3 +116,7 @@ Example: ./build/OptCuts_bin 10 input/bimba_i_f10000.obj 0.999 1 0 4.1 1 0 first
 * 'b': toggle lighting, default is OFF
 * 'p': toggle viewing seam corners (drawn as black dots), default is ON
 * 'o': take a screenshot and save the model with current UV
+
+# Build libigl static
+- CC=gcc CXX=g++ cmake -S . -B build   -DCMAKE_BUILD_TYPE=Release   -DBUILD_SHARED_LIBS=OFF   -DLIBIGL_USE_STATIC_LIBRARY=ON   -DLIBIGL_WITH_EMBREE=OFF   -DLIBIGL_WITH_OPENGL=OFF   -DLIBIGL_WITH_OPENGL_GLFW=OFF   -DLIBIGL_WITH_OPENGL_GLFW_IMGUI=OFF   -DLIBIGL_WITH_VIEWER=OFF   -DLIBIGL_WITH_PYTHON=OFF   -DLIBIGL_BUILD_TUTORIALS=OFF   -DLIBIGL_WITH_TRIANGLE=ON   -DLIBIGL_WITH_PNG=ON   -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+- cmake --build build -j2

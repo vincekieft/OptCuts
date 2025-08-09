@@ -5,7 +5,6 @@
 #include <igl/opengl/glfw/Viewer.h>
 #include <iostream>
 
-#include "tutorial_shared_path.h"
 
 // Mesh
 Eigen::MatrixXd V;
@@ -35,15 +34,15 @@ bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier
       break;
     }
     case '.':
-      viewer.core.lighting_factor += 0.1;
+      viewer.core().lighting_factor += 0.1;
       break;
     case ',':
-      viewer.core.lighting_factor -= 0.1;
+      viewer.core().lighting_factor -= 0.1;
       break;
     default: break;
   }
-  viewer.core.lighting_factor = 
-    std::min(std::max(viewer.core.lighting_factor,0.f),1.f);
+  viewer.core().lighting_factor = 
+    std::min(std::max(viewer.core().lighting_factor,0.f),1.f);
 
   return false;
 }
@@ -74,6 +73,6 @@ int main(int argc, char *argv[])
   viewer.callback_key_down = &key_down;
   key_down(viewer,'2',0);
   viewer.data().show_lines = false;
-  viewer.core.lighting_factor = 0.0f;
+  viewer.core().lighting_factor = 0.0f;
   viewer.launch();
 }

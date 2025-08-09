@@ -5,7 +5,6 @@
 #include <igl/readOFF.h>
 #include <igl/opengl/glfw/Viewer.h>
 
-#include "tutorial_shared_path.h"
 
 Eigen::MatrixXd V;
 Eigen::MatrixXi F;
@@ -27,12 +26,12 @@ bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier
   if (show_uv)
   {
     viewer.data().set_mesh(V_uv,F);
-    viewer.core.align_camera_center(V_uv,F);
+    viewer.core().align_camera_center(V_uv,F);
   }
   else
   {
     viewer.data().set_mesh(V,F);
-    viewer.core.align_camera_center(V,F);
+    viewer.core().align_camera_center(V,F);
   }
 
   viewer.data().compute_normals();

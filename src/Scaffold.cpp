@@ -13,7 +13,8 @@
 #include <igl/triangle/triangulate.h>
 #include <igl/boundary_loop.h>
 #include <igl/avg_edge_length.h>
-#include <igl/components.h>
+#include <igl/connected_components.h>
+#include <igl/adjacency_matrix.h>
 
 #include <tbb/tbb.h>
 
@@ -90,8 +91,13 @@ namespace OptCuts {
             }
             
             // compute connected component of mesh
-            Eigen::VectorXi compI_V;
-            igl::components(mesh.F, compI_V);
+            Eigen::SparseMatrix<int> A;
+            igl::adjacency_matrix(mesh.F, mesh.F, A);
+            
+            // run CC on vertices
+            Eigen::VectorXi compI_V;      // label per vertex
+            Eigen::VectorXi comp_sizes;   // size of each component (unused if you don't care)
+            int K = igl::connected_components(A, compI_V, comp_sizes);
             // mark holes
             std::set<int> processedComp;
             for(int vI = 0; vI < compI_V.size(); vI++) {

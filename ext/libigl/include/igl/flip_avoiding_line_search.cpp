@@ -7,6 +7,7 @@
 // obtain one at http://mozilla.org/MPL/2.0/.
 #include "flip_avoiding_line_search.h"
 #include "line_search.h"
+#include "PI.h"
 
 #include <Eigen/Dense>
 #include <vector>
@@ -23,7 +24,6 @@ namespace igl
     // http://math.ivanovo.ac.ru/dalgebra/Khashin/poly/index.html
     IGL_INLINE int SolveP3(std::vector<double>& x,double a,double b,double c)
     { // solve cubic equation x^3 + a*x^2 + b*x + c
-      using namespace std;
       double a2 = a*a;
         double q  = (a2 - 3*b)/9;
       double r  = (a*(2*a2-9*b) + 27*c)/54;
@@ -38,15 +38,15 @@ namespace igl
           t=acos(t);
           a/=3; q=-2*sqrt(q);
           x[0]=q*cos(t/3)-a;
-          x[1]=q*cos((t+(2*M_PI))/3)-a;
-          x[2]=q*cos((t-(2*M_PI))/3)-a;
+          x[1]=q*cos((t+(2*igl::PI))/3)-a;
+          x[2]=q*cos((t-(2*igl::PI))/3)-a;
           return(3);
         }
         else
         {
           A =-pow(fabs(r)+sqrt(r2-q3),1./3);
           if( r<0 ) A=-A;
-          B = A==0? 0 : B=q/A;
+          B = A==0? 0 : q/A;
 
           a/=3;
           x[0] =(A+B)-a;
@@ -62,7 +62,6 @@ namespace igl
 
     IGL_INLINE double get_smallest_pos_quad_zero(double a,double b, double c)
     {
-      using namespace std;
       double t1, t2;
       if(std::abs(a) > 1.0e-10)
       {
@@ -113,7 +112,6 @@ namespace igl
                                           Eigen::MatrixXd& d,
                                           int f)
     {
-      using namespace std;
     /*
           Finding the smallest timestep t s.t a triangle get degenerated (<=> det = 0)
           The following code can be derived by a symbolic expression in matlab:
@@ -179,7 +177,6 @@ namespace igl
                                           Eigen::MatrixXd& direc,
                                           int f)
     {
-      using namespace std;
       /*
           Searching for the roots of:
             +-1/6 * |ax ay az 1|
@@ -274,7 +271,6 @@ namespace igl
                                                           const Eigen::MatrixXi& F,
                                                           Eigen::MatrixXd& d)
     {
-      using namespace std;
       double max_step = INFINITY;
 
       // The if statement is outside the for loops to avoid branching/ease parallelizing
@@ -300,13 +296,12 @@ namespace igl
 }
 
 IGL_INLINE double igl::flip_avoiding_line_search(
-  const Eigen::MatrixXi F,
+  const Eigen::MatrixXi & F,
   Eigen::MatrixXd& cur_v,
-  Eigen::MatrixXd& dst_v,
-  std::function<double(Eigen::MatrixXd&)> energy,
+  const Eigen::MatrixXd& dst_v,
+  std::function<double(Eigen::MatrixXd&)> & energy,
   double cur_energy)
 {
-  using namespace std;
   Eigen::MatrixXd d = dst_v - cur_v;
 
   double min_step_to_singularity = igl::flip_avoiding::compute_max_step_from_singularities(cur_v,F,d);

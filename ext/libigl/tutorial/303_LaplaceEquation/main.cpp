@@ -6,12 +6,10 @@
 #include <igl/readOFF.h>
 #include <igl/setdiff.h>
 #include <igl/slice.h>
-#include <igl/slice_into.h>
 #include <igl/unique.h>
 #include <igl/opengl/glfw/Viewer.h>
 #include <Eigen/Sparse>
 #include <iostream>
-#include "tutorial_shared_path.h"
 
 int main(int argc, char *argv[])
 {
@@ -39,15 +37,13 @@ int main(int argc, char *argv[])
   igl::slice(L,in,b,L_in_b);
 
   // Dirichlet boundary conditions from z-coordinate
-  VectorXd bc;
   VectorXd Z = V.col(2);
-  igl::slice(Z,b,bc);
+  VectorXd bc = Z(b);
 
   // Solve PDE
   SimplicialLLT<SparseMatrix<double > > solver(-L_in_in);
-  VectorXd Z_in = solver.solve(L_in_b*bc);
   // slice into solution
-  igl::slice_into(Z_in,in,Z);
+  Z(in) = solver.solve(L_in_b*bc).eval();
 
   // Alternative, short hand
   igl::min_quad_with_fixed_data<double> mqwf;
@@ -60,14 +56,10 @@ int main(int argc, char *argv[])
   igl::min_quad_with_fixed_precompute((-L).eval(),b,Aeq,true,mqwf);
   igl::min_quad_with_fixed_solve(mqwf,B,bc,Beq,Z);
 
-  // Pseudo-color based on solution
-  MatrixXd C;
-  igl::jet(Z,true,C);
-
   // Plot the mesh with pseudocolors
   igl::opengl::glfw::Viewer viewer;
   viewer.data().set_mesh(V, F);
   viewer.data().show_lines = false;
-  viewer.data().set_colors(C);
+  viewer.data().set_data(Z);
   viewer.launch();
 }
