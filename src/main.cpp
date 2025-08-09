@@ -512,6 +512,257 @@ bool updateLambda_stationaryV(bool cancelMomentum = true, bool checkConvergence 
     return true;
 }
 
+void converge_preDrawFunc()
+{
+    infoName = "finalResult";
+    
+    if(!bijectiveParam) {
+        // perform exact solve
+        optimizer->setAllowEDecRelTol(false);
+        converged = false;
+        optimizer->setPropagateFracture(false);
+        while(!converged) {
+            proceedOptimization(1000);
+        }
+    }
+    
+    secPast += difftime(time(NULL), lastStart_world);
+    
+    optimizer->flushEnergyFileOutput();
+    optimizer->flushGradFileOutput();
+    
+    optimization_on = false;
+    std::cout << "optimization converged, with " << secPast << "s." << std::endl;
+    logFile << "optimization converged, with " << secPast << "s." << std::endl;
+    outerLoopFinished = true;
+}
+
+void toggleOptimization(void)
+{
+    optimization_on = !optimization_on;
+    if(optimization_on) {
+        if(converged) {
+            optimization_on = false;
+            std::cout << "optimization converged." << std::endl;
+        }
+        else {
+            std::cout << "start/resume optimization, press again to pause." << std::endl;
+            time(&lastStart_world);
+        }
+    }
+    else {
+        std::cout << "pause optimization, press again to resume." << std::endl;
+        std::cout << "World Time:\nTime past: " << secPast << "s." << std::endl;
+        secPast += difftime(time(NULL), lastStart_world);
+    }
+}
+
+bool postDrawFunc()
+{
+    if(offlineMode && (iterNum == 0)) {
+        toggleOptimization();
+    }
+    
+    if(saveInfo_postDraw) {
+        saveInfo_postDraw = false;
+        saveInfo(outerLoopFinished, true, outerLoopFinished);
+//        saveInfo(true, false, false);
+        // Note that the content saved in the screenshots are depends on where updateViewerData() is called
+    }
+    
+    if(outerLoopFinished) {
+        if(!isCapture3D) {
+            isCapture3D = true;
+        }
+        else {
+            if(capture3DI < 2) {
+                // take screenshot
+                std::cout << "Taking screenshot for 3D View " << capture3DI / 2 << std::endl;
+                std::string filePath = outputFolderPath + "3DView" + std::to_string(capture3DI / 2) +
+                    ((capture3DI % 2 == 0) ? "_seam.png" : "_distortion.png");
+                capture3DI++;
+            }
+            else {
+                saveInfoForPresent();
+                if(offlineMode) {
+                    exit(0);
+                }
+            }
+        }
+    }
+    
+    return false;
+}
+
+bool preDrawFunc()
+{
+    if(optimization_on)
+    {
+        if(offlineMode) {
+            while(!converged) {
+                proceedOptimization();
+            }
+        }
+        else {
+            proceedOptimization();
+        }
+        
+        if(converged) {
+            saveInfo_postDraw = true;
+            
+            double stretch_l2, stretch_inf, stretch_shear, compress_inf;
+            triSoup[channel_result]->computeStandardStretch(stretch_l2, stretch_inf, stretch_shear, compress_inf);
+            double measure_bound = optimizer->getLastEnergyVal(true) / energyParams[0];
+            
+            switch(methodType) {
+                case OptCuts::MT_EBCUTS: {
+                    if(measure_bound <= upperBound) {
+                        logFile << "measure reaches user specified upperbound " << upperBound << std::endl;
+                        
+                        infoName = "finalResult";
+                        // perform exact solve
+                        optimizer->setAllowEDecRelTol(false);
+                        converged = false;
+                        while(!converged) {
+                            proceedOptimization(1000);
+                        }
+                        secPast += difftime(time(NULL), lastStart_world);
+                        
+                        optimization_on = false;
+                        std::cout << "optimization converged, with " << secPast << "s." << std::endl;
+                        logFile << "optimization converged, with " << secPast << "s." << std::endl;
+                        outerLoopFinished = true;
+                    }
+                    else {
+                        infoName = std::to_string(iterNum);
+                        
+                        // continue to make geometry image cuts
+                        bool returnVal = optimizer->createFracture(fracThres, false, false);
+                        assert(returnVal);
+                        converged = false;
+                    }
+                    optimizer->flushEnergyFileOutput();
+                    optimizer->flushGradFileOutput();
+                    break;
+                }
+                    
+                case OptCuts::MT_OPTCUTS_NODUAL:
+                case OptCuts::MT_OPTCUTS: {
+                    infoName = std::to_string(iterNum);
+                    if(converged == 2) {
+                        converged = 0;
+                        return false;
+                    }
+                    
+                    if((methodType == OptCuts::MT_OPTCUTS) && (measure_bound <= upperBound)) {
+                        // save info once bound is reached for comparison
+                        static bool saved = false;
+                        if(!saved) {
+//                            saveScreenshot(outputFolderPath + "firstFeasible.png", 0.5, false, true);
+                            //                            triSoup[channel_result]->save(outputFolderPath + infoName + "_triSoup.obj");
+//                            triSoup[channel_result]->saveAsMesh(outputFolderPath + "firstFeasible_mesh.obj", F);
+                            secPast += difftime(time(NULL), lastStart_world);
+//                            saveInfoForPresent("info_firstFeasible.txt");
+                            time(&lastStart_world);
+                            saved = true;
+                        }
+                    }
+                    
+                    // if necessary, turn on scaffolding for random one point initial cut
+                    if(!optimizer->isScaffolding() && bijectiveParam && rand1PInitCut) {
+                        optimizer->setScaffolding(true);
+                    }
+                    
+                    double E_se; triSoup[channel_result]->computeSeamSparsity(E_se);
+                    E_se /= triSoup[channel_result]->virtualRadius;
+                    const double E_SD = optimizer->getLastEnergyVal(true) / energyParams[0];
+                    
+                    std::cout << iterNum << ": " << E_SD << " " << E_se << " " << triSoup[channel_result]->V_rest.rows() << std::endl;
+                    logFile << iterNum << ": " << E_SD << " " << E_se << " " << triSoup[channel_result]->V_rest.rows() << std::endl;
+                    optimizer->flushEnergyFileOutput();
+                    optimizer->flushGradFileOutput();
+                    
+                    // continue to split boundary
+                    if((methodType == OptCuts::MT_OPTCUTS) &&
+                       (!updateLambda_stationaryV()))
+                    {
+                        // oscillation detected
+                        converge_preDrawFunc();
+                    }
+                    else {
+                        logFile << "boundary op V " << triSoup[channel_result]->V_rest.rows() << std::endl;
+                        if(optimizer->createFracture(fracThres, false, topoLineSearch)) {
+                            converged = false;
+                        }
+                        else {
+                            // if no boundary op, try interior split if split is the current best boundary op
+                            if((measure_bound > upperBound) &&
+                               optimizer->createFracture(fracThres, false, topoLineSearch, true))
+                            {
+                                logFile << "interior split " << triSoup[channel_result]->V_rest.rows() << std::endl;
+                                converged = false;
+                            }
+                            else {
+                                if((methodType == OptCuts::MT_OPTCUTS_NODUAL) ||
+                                   (!updateLambda_stationaryV(false, true)))
+                                {
+                                    // all converged
+                                    converge_preDrawFunc();
+                                }
+                                else {
+                                    // split or merge after lambda update
+                                    if(reQuery) {
+                                        filterExp_in += std::log(2.0) / std::log(inSplitTotalAmt);
+                                        filterExp_in = std::min(1.0, filterExp_in);
+                                        while(!optimizer->createFracture(fracThres, false, topoLineSearch, true))
+                                        {
+                                            filterExp_in += std::log(2.0) / std::log(inSplitTotalAmt);
+                                            filterExp_in = std::min(1.0, filterExp_in);
+                                        }
+                                        reQuery = false;
+                                        //TODO: set filtering param back?
+                                    }
+                                    else {
+                                        optimizer->createFracture(opType_queried, path_queried, newVertPos_queried, topoLineSearch);
+                                    }
+                                    opType_queried = -1;
+                                    converged = false;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                    
+                case OptCuts::MT_DISTMIN: {
+                    converge_preDrawFunc();
+                    break;
+                }
+            }
+        }
+    }
+    else {
+        if(isCapture3D && (capture3DI < 2)) {
+            // change view accordingly
+            double rotDeg = ((capture3DI < 8) ? (M_PI_2 * (capture3DI / 2)) : M_PI_2);
+            Eigen::Vector3f rotAxis = Eigen::Vector3f::UnitY();
+            if((capture3DI / 2) == 4) {
+                rotAxis = Eigen::Vector3f::UnitX();
+            }
+            else if((capture3DI / 2) == 5) {
+                rotAxis = -Eigen::Vector3f::UnitX();
+            }
+            viewChannel = channel_result;
+            viewUV = false;
+            showSeam = true;
+            isLighting = false;
+            showTexture = capture3DI % 2;
+            showDistortion = 2 - capture3DI % 2;
+        }
+    }
+    return false;
+}
+
 int main(int argc, char *argv[])
 {
     int progMode = 0;
@@ -1016,6 +1267,11 @@ int main(int argc, char *argv[])
                                            optimizer->getResult().vertWeight);
         
         std::cout << "OptCuts with regional seam placement" << std::endl;
+    }
+
+     while(true) {
+        preDrawFunc();
+        postDrawFunc();
     }
     
     // Before exit
