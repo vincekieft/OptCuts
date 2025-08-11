@@ -45,16 +45,6 @@ set_target_properties(igl::triangle PROPERTIES
   INTERFACE_LINK_LIBRARIES      "${TRIANGLE_LIB}"
 )
 
-# libigl png wrapper + libpng + zlib (archive names vary)
-# file(GLOB LIBPNG_A "${LIBIGL_LIBDIR}/libpng*.a")
-# file(GLOB  ZLIB_A  "${LIBIGL_LIBDIR}/libz*.a")
-# add_library(igl::png STATIC IMPORTED GLOBAL)
-# set_target_properties(igl::png PROPERTIES
-#   IMPORTED_LOCATION             "${LIBIGL_LIBDIR}/libigl_png.a"
-#   INTERFACE_INCLUDE_DIRECTORIES "${LIBIGL_INCDIR}"
-#   INTERFACE_LINK_LIBRARIES      "${LIBPNG_A};${ZLIB_A}"
-# )
-
 # --- sources ---
 file(GLOB SRCFILES
   src/main.cpp
@@ -84,7 +74,6 @@ target_link_libraries(${PROJECT_NAME}_bin
   PRIVATE
     igl::core
     igl::triangle
-    # igl::png
     TBB::tbb
 )
 

@@ -6,3 +6,4 @@ build*/
 output/
 ext/tbb/
 ext/.cache
+.venv
