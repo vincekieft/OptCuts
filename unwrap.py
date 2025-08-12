@@ -1,10 +1,14 @@
+import argparse
+import os
+import signal
 import numpy as np
 import xatlas
 import time
 import trimesh
 from pathlib import Path
-from trimesh.proximity import ProximityQuery
-from trimesh.triangles import points_to_barycentric
+import igl
+
+from segmentation import export_label_components, segment_per_components
 
 def unwrap_with_xatlas(comp_mesh: trimesh.Trimesh) -> trimesh.Trimesh | None:
     """
@@ -48,24 +52,27 @@ def build_component_mesh(mesh: trimesh.Trimesh, face_idx: np.ndarray) -> trimesh
     comp = trimesh.Trimesh(vertices=V_new, faces=F_new, process=False)
     return comp
 
-def resolve_optcuts_output(input_obj: Path) -> Path | None:
+def find_optcuts_result(workdir: Path) -> Path | None:
     """
-    Try common output patterns. Adjust if your OptCuts build writes a specific filename.
-    Order: overwrite (same path), *_out.obj, *_uv.obj, *_result.obj
+    Search the per-job working directory for OptCuts outputs.
+    Prefers finalResult_mesh_normalizedUV.obj, then finalResult_mesh.obj,
+    else the first .obj found under output/.
     """
-    # If OptCuts overwrites input, that's already the path to read.
-    if input_obj.exists():
-        return input_obj
-    stem = input_obj.with_suffix("")
-    candidates = [
-        stem.with_name(stem.name + "_out").with_suffix(".obj"),
-        stem.with_name(stem.name + "_uv").with_suffix(".obj"),
-        stem.with_name(stem.name + "_result").with_suffix(".obj"),
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+    outdir = workdir / "output"
+    if not outdir.exists():
+        return None
+
+    # Prefer normalized UVs
+    hits = list(outdir.rglob("finalResult_mesh_normalizedUV.obj"))
+    if hits:
+        return hits[0]
+
+    hits = list(outdir.rglob("finalResult_mesh.obj"))
+    if hits:
+        return hits[0]
+
+    hits = list(outdir.rglob("*.obj"))
+    return hits[0] if hits else None
 
 def _get_mesh_uv_array(m: trimesh.Trimesh) -> np.ndarray | None:
     try:
@@ -77,38 +84,97 @@ def _get_mesh_uv_array(m: trimesh.Trimesh) -> np.ndarray | None:
     except Exception:
         return None
 
+def repack_with_xatlas(merged: trimesh.Trimesh,
+                       resolution: int = 2048,
+                       padding_px: int = 4,
+                       texels_per_unit: float | None = None,
+                       rotate: bool = True) -> trimesh.Trimesh:
+    V = merged.vertices.astype(np.float32)
+    F = merged.faces.astype(np.uint32)
+    UV = np.asarray(merged.visual.uv, dtype=np.float32)
+
+    atlas = xatlas.Atlas()
+
+    # Many builds of the python wrapper accept existing UVs to preserve charts.
+    # If your wrapper doesn't support the kwarg, see Option B below.
+    atlas.add_mesh(V, F, uvs=UV)
+
+    # Options (attribute names differ slightly across builds; guard with hasattr)
+    chart = xatlas.ChartOptions()
+    para  = xatlas.ParameterizeOptions()
+    pack  = xatlas.PackOptions()
+
+    if hasattr(pack, "resolution"):       pack.resolution = int(resolution)
+    if hasattr(pack, "padding"):          pack.padding = int(padding_px)
+    if hasattr(pack, "rotateCharts"):     pack.rotateCharts = bool(rotate)
+    if hasattr(pack, "blockAlign"):       pack.blockAlign = True
+    if hasattr(pack, "bruteForce"):       pack.bruteForce = True
+    if hasattr(pack, "texelsPerUnit"):    pack.texelsPerUnit = float(texels_per_unit or 0.0)
+    # When texelsPerUnit==0, xatlas auto-scales to fill the texture;
+    # set a value (e.g. 256) to enforce a specific density.
+
+    atlas.generate(chart, para, pack)
+
+    vmapping, indices, new_uv = atlas[0]
+    vmapping = np.asarray(vmapping, dtype=np.int64)
+    indices  = np.asarray(indices,  dtype=np.int64).reshape(-1, 3)
+    new_uv   = np.asarray(new_uv,   dtype=np.float64)
+
+    # Build a packed mesh (same geometry; vertices may be duplicated along seams)
+    V_out = merged.vertices[vmapping]
+    packed = trimesh.Trimesh(vertices=V_out, faces=indices, process=False)
+    packed.visual = trimesh.visual.TextureVisuals(uv=new_uv)
+    return packed
+
 def reproject_part_uvs_to_original(original_mesh: trimesh.Trimesh,
                                    processed_mesh: trimesh.Trimesh,
                                    part_face_ids: np.ndarray,
-                                   uv_face_corner_accum: np.ndarray):
+                                   uv_face_corner_accum: np.ndarray) -> bool:
     """
-    Sample UVs from processed_mesh to the original_mesh corners for faces in part_face_ids.
-    Writes into uv_face_corner_accum (F,3,2) in-place.
+    Seam-stable UV transfer:
+      - Build the same local component we fed to OptCuts
+      - Match each local face to the nearest processed face via centroids (igl)
+      - For each corner, copy UV from the nearest vertex of that matched processed face
     """
     uv = _get_mesh_uv_array(processed_mesh)
     if uv is None:
         return False
 
-    prox = ProximityQuery(processed_mesh)
-
     ofaces = np.asarray(part_face_ids, dtype=np.int64)
-    P = original_mesh.vertices[original_mesh.faces[ofaces]]   # (m,3,3)
-    P_flat = P.reshape(-1, 3)
 
-    closest_pts, _, tri_idx = prox.on_surface(P_flat)
-    tri_idx = tri_idx.astype(np.int64)
+    # Local component (same as what we exported)
+    comp = build_component_mesh(original_mesh, ofaces)
 
-    tris_xyz = processed_mesh.triangles[tri_idx]              # (N,3,3)
-    tris_vid = processed_mesh.faces[tri_idx].astype(np.int64) # (N,3)
-    tris_uv  = uv[tris_vid]                                   # (N,3,2)
+    # --- Make all arrays plain, C-contiguous, correct dtypes ---
+    C_local = np.ascontiguousarray(np.asarray(comp.triangles_center, dtype=np.float64))  # (m,3)
+    Vp      = np.ascontiguousarray(np.asarray(processed_mesh.vertices, dtype=np.float64)) # (Nv,3)
+    Fp      = np.ascontiguousarray(np.asarray(processed_mesh.faces, dtype=np.int32))      # (Mf,3)
+    uv_proc = np.ascontiguousarray(np.asarray(uv, dtype=np.float64))                      # (Nv,2)
 
-    bary = points_to_barycentric(tris_xyz, closest_pts)       # (N,3)
-    uvs_interp = (bary[..., None] * tris_uv).sum(axis=1)      # (N,2)
+    # Closest processed triangle for each local face centroid
+    _, tri_idx, _ = igl.point_mesh_squared_distance(C_local, Vp, Fp)
+    tri_idx = np.asarray(tri_idx, dtype=np.int64).ravel()                                  # (m,)
 
+    # Gather processed triangle data
+    proc_face_vid = Fp[tri_idx].astype(np.int64)      # (m,3)
+    proc_pos      = Vp[proc_face_vid]                 # (m,3,3)
+    proc_uv       = uv_proc[proc_face_vid]            # (m,3,2)
+
+    comp_faces = np.ascontiguousarray(np.asarray(comp.faces, dtype=np.int64))             # (m,3)
+    comp_verts = np.ascontiguousarray(np.asarray(comp.vertices, dtype=np.float64))        # (Nc,3)
+
+    # For each local face, map its 3 corners
     m = ofaces.shape[0]
-    face_ids_rep = np.repeat(ofaces, 3)
-    corner_ids   = np.tile(np.arange(3, dtype=np.int64), m)
-    uv_face_corner_accum[face_ids_rep, corner_ids] = uvs_interp
+    for li in range(m):
+        orig_f  = int(ofaces[li])
+        comp_vid = comp_faces[li]                     # (3,)
+        comp_pos = comp_verts[comp_vid]               # (3,3)
+
+        # distances from each local corner to the 3 processed verts (3x3)
+        d2 = ((proc_pos[li][None, :, :] - comp_pos[:, None, :]) ** 2).sum(axis=2)
+        nearest_idx = d2.argmin(axis=1)               # (3,) choose which processed vertex
+        uv_face_corner_accum[orig_f] = proc_uv[li][nearest_idx]
+
     return True
 
 def extract_label_components(mesh: trimesh.Trimesh, labels: np.ndarray, *, min_faces: int = 1):
@@ -172,15 +238,20 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
                             min_faces: int = 1,
                             keep_temp: bool = False,
                             verbose: bool = True,
-                            timeout_sec: float = 30.0) -> np.ndarray:
+                            timeout_sec: float = 60.0) -> np.ndarray:
     """
     Split -> run OptCuts per part (with timeout) -> project UVs back.
     If OptCuts fails or times out, fall back to xatlas for that part.
     """
-    exe = Path(exe)
-    if not exe.exists():
-        raise FileNotFoundError(f"OptCuts binary not found: {exe}")
-
+    script_dir = Path(__file__).resolve().parent
+    exe_path = Path(exe).expanduser()
+    if not exe_path.is_absolute():
+        exe_path = (script_dir / exe_path).resolve()
+        
+    if not exe_path.exists():
+        raise FileNotFoundError(
+            f"OptCuts binary not found. Passed '{exe}', resolved to '{exe_path}'")
+        
     F_total = mesh.faces.shape[0]
     uv_face_corner = np.full((F_total, 3, 2), np.nan, dtype=np.float64)
 
@@ -197,27 +268,41 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
     tmpdir = Path(tmp_ctx.name)
 
     def start_one(pi: int, lab: int, face_ids: np.ndarray) -> tuple[subprocess.Popen, dict]:
+        # Make a dedicated workdir for this job
+        workdir = (tmpdir / f"job_{pi:03d}")
+        (workdir / "input").mkdir(parents=True, exist_ok=True)
+
         comp_mesh = build_component_mesh(mesh, face_ids)
-        obj_path = tmpdir / f"part{pi:03d}_label{lab}.obj"
+        obj_path = workdir / "input" / f"part{pi:03d}_label{lab}.obj"
         comp_mesh.export(obj_path, file_type="obj")
-        cmd = [str(exe), "100", str(obj_path), "0.999", "1", "0", "4.1", "1", "0"]
-        pop = subprocess.Popen(cmd, start_new_session=True)
+
+        # Run OptCuts with cwd=workdir so its "output/..." lands inside this job folder
+        cmd = [str(exe_path), "100", str(obj_path), "0.999", "1", "0", "4.1", "1", "0"]
+        pop = subprocess.Popen(cmd, start_new_session=True, cwd=workdir)
         meta = {
             "pi": pi, "lab": lab, "face_ids": face_ids,
-            "obj_path": obj_path, "start": time.time()
+            "workdir": workdir, "obj_path": obj_path, "start": time.time()
         }
         return pop, meta
 
     def kill_proc(p: subprocess.Popen):
         try:
-            p.terminate()
-            p.wait(timeout=1.5)
+            # kill the whole process group if possible
+            if hasattr(os, "killpg"):
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                p.wait(timeout=1.0)
+            else:
+                p.terminate()
+                p.wait(timeout=1.5)
         except Exception:
             try:
-                p.kill()
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                else:
+                    p.kill()
             except Exception:
                 pass
-
+            
     def fallback_with_xatlas(face_ids: np.ndarray):
         comp_mesh = build_component_mesh(mesh, face_ids)
         pmesh_fb = unwrap_with_xatlas(comp_mesh)
@@ -239,7 +324,7 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
     while running:
         still: list[tuple[subprocess.Popen, dict]] = []
         for p, meta in running:
-            pi, lab, face_ids, obj_path, t0 = meta["pi"], meta["lab"], meta["face_ids"], meta["obj_path"], meta["start"]
+            pi, lab, face_ids, workdir, t0 = meta["pi"], meta["lab"], meta["face_ids"], meta["workdir"], meta["start"]
 
             # Timeout?
             if (time.time() - t0) > timeout_sec:
@@ -269,7 +354,7 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
                 if verbose:
                     print(f"[optcuts]    fallback {'OK' if ok else 'FAILED (no xatlas?)'} for part {pi}")
             else:
-                out_path = resolve_optcuts_output(obj_path)
+                out_path = find_optcuts_result(workdir)
                 if out_path is None:
                     if verbose:
                         print(f"[optcuts] ? part {pi} output not found -> xatlas fallback")
@@ -311,3 +396,64 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
         tmp_ctx.cleanup()
 
     return uv_face_corner
+
+def bake_uvs_with_vertex_splits(original_mesh: trimesh.Trimesh,
+                                uv_face_corner: np.ndarray,
+                                *,
+                                round_uv: int = 7) -> trimesh.Trimesh:
+    F = original_mesh.faces.astype(np.int64)
+    V = original_mesh.vertices
+    F_count = F.shape[0]
+
+    index_map = {}  # (orig_vid, ru, rv) -> new_vid
+    verts_out = []
+    uvs_out = []
+    faces_out = np.empty_like(F)
+
+    for i in range(F_count):
+        for j in range(3):
+            vid = int(F[i, j])
+            uv = uv_face_corner[i, j]
+            if not np.isfinite(uv).all():
+                uv = np.array([0.0, 0.0], dtype=np.float64)  # fallback if anything missed
+            key = (vid, round(float(uv[0]), round_uv), round(float(uv[1]), round_uv))
+            if key not in index_map:
+                index_map[key] = len(verts_out)
+                verts_out.append(V[vid].tolist())
+                uvs_out.append([float(uv[0]), float(uv[1])])
+            faces_out[i, j] = index_map[key]
+
+    mesh_out = trimesh.Trimesh(vertices=np.asarray(verts_out, dtype=np.float64),
+                               faces=faces_out.astype(np.int64),
+                               process=False)
+    mesh_out.visual = trimesh.visual.TextureVisuals(uv=np.asarray(uvs_out, dtype=np.float64))
+    return mesh_out
+
+def main():
+    ap = argparse.ArgumentParser(description="EXACT Shapira08 SDF+GMM+k-way graph cut (per connected component)")
+    ap.add_argument("input", help="path to mesh (.obj/.ply/...)")
+    ap.add_argument("--output", default="out", help="output directory")
+    ap.add_argument("--exe", "-e", default="build/OptCuts_bin", help="Path to OptCuts binary")
+    args = ap.parse_args()
+    
+    mesh = trimesh.load_mesh(args.input, process=False)
+    mesh.merge_vertices(merge_tex=True, merge_norm=True)
+    mesh.fix_normals()
+
+    labels, _ = segment_per_components(mesh)
+    
+    export_label_components(mesh, labels, args.output)
+    
+    uv_face_corner = run_optcuts_and_project(mesh, labels, exe=args.exe, timeout_sec=60.0)
+    merged = bake_uvs_with_vertex_splits(mesh, uv_face_corner)
+    # repacked = repack_with_xatlas(merged)
+    
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / (Path(args.input).stem + "_with_uv.obj")
+    merged.export(out_path, file_type="obj")
+    print(f"[merge] Wrote merged OBJ with UVs -> {out_path}")
+
+
+if __name__ == "__main__":
+    main()

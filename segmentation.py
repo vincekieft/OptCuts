@@ -4,6 +4,9 @@
 import argparse
 from pathlib import Path
 import numpy as np
+if not hasattr(np, "infty"):
+    np.infty = np.inf
+
 import trimesh
 from igl.embree import shape_diameter_function
 from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
@@ -312,7 +315,7 @@ def shapira08_graph_cut(unary_e1: np.ndarray, edges: np.ndarray, w_edge: np.ndar
 def segment_mesh_shapira08_exact(mesh: trimesh.Trimesh,
                                        *,
                                        k_min=1, k_max=4,
-                                       rays=128, auto_lambda_ratio=0.5,
+                                       rays=128, auto_lambda_ratio=1,
                                        k_method="bic", min_faces_per_cluster=250,
                                        debug=False, lam=None):
     mesh.fix_normals()
@@ -389,8 +392,8 @@ def split_face_components(mesh: trimesh.Trimesh):
         out.append((sub, comp))
     return out
 
-def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None,
-                           rays: int = 128, auto_lambda_ratio: float = 0.5,
+def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None = None,
+                           rays: int = 64, auto_lambda_ratio: float = 0.3,
                            debug: bool = False):
     """
     Split the mesh into connected face-components, segment each,
@@ -433,15 +436,9 @@ def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None,
 # ---------------------------
 # CLI / Viewer
 # ---------------------------
-
 def main():
     ap = argparse.ArgumentParser(description="EXACT Shapira08 SDF+GMM+k-way graph cut (per connected component)")
     ap.add_argument("input", help="path to mesh (.obj/.ply/...)")
-    ap.add_argument("--lambda_ratio", type=float, default=0.5,
-                    help="λ for the pairwise term. If omitted, λ is auto-chosen.")
-    ap.add_argument("--lam", type=float, default=None,
-                    help="λ for the pairwise term. If omitted, λ is auto-chosen.")
-    ap.add_argument("--rays", type=int, default=128)
     ap.add_argument("--viz", choices=["labels", "sdf"], default="labels",
                     help="What to visualize: segmentation labels or SDF heatmap.")
     ap.add_argument("--no-split", action="store_true",
@@ -455,18 +452,7 @@ def main():
     mesh.merge_vertices(merge_tex=True, merge_norm=True)
     mesh.fix_normals()
 
-    if args.no_split:
-        labels, nsdf, _ = segment_mesh_shapira08_exact(
-            mesh, lam=args.lam, rays=args.rays, debug=args.debug
-        )
-    else:
-        labels, nsdf = segment_per_components(
-            mesh, 
-            lam=args.lam, 
-            rays=args.rays, 
-            auto_lambda_ratio=args.lambda_ratio, 
-            debug=args.debug
-        )
+    labels, nsdf = segment_per_components(mesh)
 
     export_label_components(mesh, labels, args.output)
 
