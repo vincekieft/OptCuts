@@ -4,31 +4,427 @@
 import argparse
 from pathlib import Path
 import numpy as np
-if not hasattr(np, "infty"):
-    np.infty = np.inf
-
 import trimesh
-from igl.embree import shape_diameter_function
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
 import gco
+
+import sys; sys.path.append('./sdf120/build')
+import sdf120
+
+if not hasattr(np, "infty"):
+    np.infty = np.inf
 try:
     import pyrender
 except Exception:
     pyrender = None
 
+def _compute_nsdf_once(mesh: trimesh.Trimesh, *, rays: int) -> np.ndarray:
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    F = np.asarray(mesh.faces,    dtype=np.int32)
+
+    sdf  = sdf120.compute_sdf(V, F, rays=rays, cone_deg=120.0, postprocess=True)
+    sdf01 = np.clip(
+        (sdf - np.percentile(sdf, 1)) /
+        max(np.percentile(sdf, 99) - np.percentile(sdf, 1), 1e-9), 0, 1
+    )
+    sdf_s = smooth_blend_sdf(
+        mesh, sdf01,
+        smooth_time=12.0,
+        sigma_angle_deg=50.0,
+        theta_stop_deg=88.0,
+        edge_len_power=1.0,
+        inner=None, outer=None,
+        gamma=2.5,
+        neutral='median'
+    )
+    nsdf = log_remap(robust_norm01(sdf_s, 1, 99), alpha=4.0)
+    return nsdf
+
+# ---- one GC pass on a submesh (EXACTLY your weights & cut) ----
+def _gc_split(submesh: trimesh.Trimesh,
+              nsdf_sub: np.ndarray,
+              *,
+              k: int,
+              lam: float | None,
+              auto_lambda_ratio: float) -> tuple[np.ndarray, float, int, np.ndarray, np.ndarray, np.ndarray]:
+    U, k_eff = gmm_unary_fixed(nsdf_sub, k=k)
+    if k_eff <= 1:
+        return np.zeros(len(submesh.faces), np.int32), 0.0, k_eff, U, np.empty((0,2), np.int32), np.empty((0,), np.float64)
+
+    edges, w = dihedral_edge_term(submesh)
+
+    if lam is None:
+        U0 = U - U.min(axis=1, keepdims=True)
+        delta = float(np.median(U0.max(axis=1))) if U0.size else 0.0
+        deg   = np.bincount(edges.ravel(), minlength=U.shape[0]).mean() if edges.size else 0.0
+        wmean = float(w.mean()) if w.size else 1.0
+        lam = 0.0 if (delta <= 0 or deg <= 0 or wmean <= 0) else delta / (auto_lambda_ratio * deg * wmean)
+
+    labels = shapira08_graph_cut(U, edges, w, lam, add_eps=True)
+    return labels.astype(np.int32), float(lam), k_eff, U, edges.astype(np.int32), w
+
+# ---- recursive splitter that reuses nsdf and your GC each time ----
+def _recurse_gc(mesh: trimesh.Trimesh,
+                nsdf: np.ndarray,
+                face_idx: np.ndarray,
+                *,
+                depth: int,
+                max_depth: int,
+                k_this: int,
+                k_next: int,
+                lam: float | None,
+                auto_lambda_ratio: float,
+                min_faces: int,
+                # acceptance controls:
+                accept_rel_gain: float = 0.002,   # require ≥0.2% relative energy gain vs single label
+                mu_diff_min: float = 0.03,        # require ≥0.03 gap in nsdf means (thickness difference)
+                debug: bool = False) -> np.ndarray:
+
+    if face_idx.size == 0:
+        return np.zeros(0, np.int32)
+
+    max_faces = max(min_faces, 3)
+    if (depth >= max_depth) or (face_idx.size < max_faces):
+        return np.zeros(face_idx.size, np.int32)
+
+    sub = build_component_mesh(mesh, face_idx)
+    nsdf_sub = nsdf[face_idx]
+
+    k_use = k_this if depth == 0 else k_next
+    labels, lam_used, k_eff, U, edges, w = _gc_split(
+        sub, nsdf_sub, k=k_use, lam=lam, auto_lambda_ratio=auto_lambda_ratio
+    )
+
+    # if GC produced <2 labels, stop here
+    if labels.max() <= 0:
+        return np.zeros(face_idx.size, np.int32)
+
+    # ---- acceptance gate: energy improvement AND nsdf thickness separation ----
+    E_split  = _potts_energy(U, edges, w, lam_used, labels)
+    E_single = _best_single_label_energy(U)
+    gain = E_single - E_split                          # positive = split is better
+    rel_gain = gain / max(abs(E_single), 1e-9)
+
+    # thickness gap between groups
+    uniq = np.unique(labels)
+    mu = []
+    for lab in uniq:
+        vals = nsdf_sub[labels == lab]
+        mu.append(float(vals.mean()) if vals.size else 0.0)
+    mu_gap = 0.0 if len(mu) < 2 else float(np.max(mu) - np.min(mu))
+
+    if debug:
+        print(f"[depth {depth}] faces={face_idx.size} k={k_use} "
+              f"E_single={E_single:.4g} E_split={E_split:.4g} rel_gain={rel_gain:.4%} mu_gap={mu_gap:.4f}")
+
+    # reject weak / thickness-similar splits
+    if (rel_gain < accept_rel_gain) or (mu_gap < mu_diff_min):
+        if debug:
+            print(f"[depth {depth}] split REJECTED (rel_gain<{accept_rel_gain} or mu_gap<{mu_diff_min})")
+        return np.zeros(face_idx.size, np.int32)
+
+    # ---- otherwise, recurse per island ----
+    island_id, islands = _islands_from_labels(sub, labels)
+    out = -np.ones(face_idx.size, np.int32)
+    next_off = 0
+    for isl in islands:
+        if isl.size < max_faces or depth == max_depth:
+            out[isl] = next_off
+            next_off += 1
+            continue
+
+        child = _recurse_gc(
+            mesh, nsdf, face_idx[isl],
+            depth=depth+1, max_depth=max_depth,
+            k_this=k_next, k_next=k_next,
+            lam=lam, auto_lambda_ratio=auto_lambda_ratio,
+            min_faces=min_faces,
+            accept_rel_gain=accept_rel_gain,
+            mu_diff_min=mu_diff_min,
+            debug=debug
+        )
+        if child.max() <= 0:
+            out[isl] = next_off
+            next_off += 1
+        else:
+            out[isl] = child + next_off
+            next_off += int(child.max() + 1)
+
+    _, remap = np.unique(out, return_inverse=True)
+    return remap.astype(np.int32)
+
+# ----- helpers for energy-based acceptance -----
+def _potts_energy(U: np.ndarray, edges: np.ndarray, w: np.ndarray, lam: float, labels: np.ndarray) -> float:
+    # unary
+    E_u = float(U[np.arange(U.shape[0]), labels].sum())
+    # pairwise Potts
+    if edges.size:
+        cut = labels[edges[:, 0]] != labels[edges[:, 1]]
+        E_p = float(lam * w[cut].sum())
+    else:
+        E_p = 0.0
+    return E_u + E_p
+
+def _best_single_label_energy(U: np.ndarray) -> float:
+    # no pairwise term if single label everywhere
+    return float(U.sum(axis=0).min())
+
+def segment_mesh_iterative_gc(mesh: trimesh.Trimesh,
+                              *,
+                              rays: int = 30,
+                              k0: int = 2,
+                              k_next: int = 2,
+                              max_depth: int = 3,
+                              lam: float | None = None,
+                              auto_lambda_ratio: float = 0.3,
+                              min_faces: int = 120,
+                              split_components_first: bool = True,
+                              debug: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Top-down recursion:
+      - compute nsdf once
+      - initial GC with k0
+      - per-island GC again with k_next, repeat up to max_depth
+    Uses the same gmm_unary_fixed, dihedral_edge_term, and shapira08_graph_cut.
+    """
+    F = len(mesh.faces)
+    if F == 0:
+        return np.zeros(0, np.int32), np.zeros(0, np.float64)
+
+    nsdf = _compute_nsdf_once(mesh, rays=rays)
+
+    parts = [(mesh, np.arange(F, dtype=np.int64))] if not split_components_first else split_face_components(mesh)
+
+    global_labels = np.full(F, -1, np.int32)
+    offset = 0
+    for si, (sub, orig_idx) in enumerate(parts):
+        if debug:
+            print(f"[iter-gc] part {si} faces={len(orig_idx)}")
+        lab_sub = _recurse_gc(
+            mesh, nsdf, orig_idx,
+            depth=0, max_depth=max_depth,
+            k_this=k0, k_next=k_next,
+            lam=lam, auto_lambda_ratio=auto_lambda_ratio,
+            min_faces=min_faces,
+            debug=debug
+        )
+        if lab_sub.size and lab_sub.max() >= 0:
+            global_labels[orig_idx] = lab_sub + offset
+            offset += int(lab_sub.max() + 1)
+        else:
+            global_labels[orig_idx] = offset
+            offset += 1
+
+    # compact global labels
+    _, remap = np.unique(global_labels, return_inverse=True)
+    global_labels = remap.astype(np.int32)
+    return global_labels, nsdf
+
+def _islands_from_labels(mesh: trimesh.Trimesh, labels: np.ndarray):
+    """Return island_id per face and a list of arrays (faces in each island)."""
+    F = len(labels)
+    adj = [[] for _ in range(F)]
+    E = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+    for a, b in E:
+        a = int(a); b = int(b)
+        adj[a].append(b); adj[b].append(a)
+
+    island_id = -np.ones(F, dtype=np.int64)
+    islands = []
+    cur = 0
+    for f0 in range(F):
+        if island_id[f0] != -1:
+            continue
+        lab = labels[f0]
+        stack = [f0]
+        comp = []
+        island_id[f0] = cur
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if island_id[v] == -1 and labels[v] == lab:
+                    island_id[v] = cur
+                    stack.append(v)
+        islands.append(np.asarray(comp, dtype=np.int64))
+        cur += 1
+    return island_id, islands  # len(islands)=R
+
+def _rag_between_islands(mesh: trimesh.Trimesh, island_id: np.ndarray):
+    """Build adjacency & boundary stats between islands."""
+    E = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+    if E.size == 0:
+        return (np.zeros((0,2), np.int64),
+                np.zeros((0,), np.float64),
+                np.zeros((0,), np.float64),
+                np.zeros((0,), np.float64))
+    I0 = island_id[E[:,0]]; I1 = island_id[E[:,1]]
+    mask = I0 != I1
+    if not np.any(mask):
+        return (np.zeros((0,2), np.int64),
+                np.zeros((0,), np.float64),
+                np.zeros((0,), np.float64),
+                np.zeros((0,), np.float64))
+    I0 = I0[mask]; I1 = I1[mask]
+    pairs = np.stack([np.minimum(I0, I1), np.maximum(I0, I1)], axis=1)
+
+    # boundary attributes
+    theta = np.asarray(mesh.face_adjacency_angles, dtype=np.float64)[mask]       # [0,pi]
+    # signed concavity
+    eidx  = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)[mask]
+    v0, v1 = mesh.vertices[eidx[:,0]], mesh.vertices[eidx[:,1]]
+    eh = v1 - v0; eh /= (np.linalg.norm(eh, axis=1, keepdims=True) + 1e-12)
+    n  = np.asarray(mesh.face_normals, dtype=np.float64)
+    n0, n1 = n[E[mask,0]], n[E[mask,1]]
+    sgn = np.sign((np.cross(n0, n1) * eh).sum(1))   # <0 concave
+
+    keys, inv = np.unique(pairs, axis=0, return_inverse=True)
+    cnt   = np.bincount(inv).astype(np.float64)
+    thavg = np.bincount(inv, weights=theta, minlength=len(keys)) / np.maximum(cnt, 1.0)
+    concf = np.bincount(inv, weights=(sgn < 0).astype(np.float64), minlength=len(keys)) / np.maximum(cnt, 1.0)
+
+    return keys.astype(np.int64), thavg, concf, cnt
+
+def _island_stats(nsdf: np.ndarray, islands: list[np.ndarray]):
+    R = len(islands)
+    size = np.array([len(ix) for ix in islands], dtype=np.int64)
+    # mean/std via sums
+    mu   = np.zeros(R, dtype=np.float64)
+    sig  = np.zeros(R, dtype=np.float64)
+    for i, ix in enumerate(islands):
+        vals = nsdf[ix]
+        mu[i]  = float(np.mean(vals)) if ix.size else 0.0
+        sig[i] = float(np.std(vals) + 1e-9)
+    return size, mu, sig
+
+def _bhattacharyya_1d(mu1, s1, mu2, s2):
+    return 0.25*np.log((s1*s1 + s2*s2)/(2.0*s1*s2)) + ((mu1-mu2)**2)/(4.0*(s1*s1 + s2*s2))
+
+def merge_label_islands(
+    submesh: trimesh.Trimesh,
+    labels: np.ndarray,   # (F,)
+    nsdf:   np.ndarray,   # (F,)
+    *,
+    min_region_faces: int = 150,     # force-merge islands smaller than this
+    theta_keep_deg: float = 65.0,    # avoid merging across stronger creases than this (unless island is tiny)
+    concave_veto_frac: float = 0.85, # avoid mostly concave boundaries (unless island is tiny)
+    target_islands: int | None = None,  # keep merging similar neighbors until <= target
+    mu_tol: float = 0.06,            # SDF-mean similarity threshold
+    bhat_tol: float = 0.03,          # OR Bhattacharyya threshold
+    max_passes: int = 12,
+) -> np.ndarray:
+    """Merge works on connected *islands*, not whole labels. Only adjacent islands can merge."""
+    labels = labels.astype(np.int32, copy=True)
+    F = labels.size
+    if F == 0:
+        return labels
+
+    # Initial islands
+    island_id, islands = _islands_from_labels(submesh, labels)
+    θ_keep = np.deg2rad(theta_keep_deg)
+
+    def relabel_from_islands(islands_list):
+        out = np.empty(F, dtype=np.int32)
+        for nid, ix in enumerate(islands_list):
+            out[ix] = nid
+        return out
+
+    for _ in range(max_passes):
+        R = len(islands)
+        if R <= 1:
+            break
+
+        keys, thavg, concf, _cnt = _rag_between_islands(submesh, island_id)
+        if keys.shape[0] == 0:
+            break
+
+        size, mu, sig = _island_stats(nsdf, islands)
+
+        # ---- Pass A: force-merge small islands
+        small_ids = [i for i in range(R) if size[i] < min_region_faces]
+        did_merge = False
+        if small_ids:
+            # build neighbor lists
+            neigh = {i: [] for i in range(R)}
+            for (a, b), th, cf in zip(keys, thavg, concf):
+                neigh[a].append((b, th, cf))
+                neigh[b].append((a, th, cf))
+            for s in small_ids:
+                if not neigh.get(s):
+                    continue
+                best = None; best_score = 1e9
+                for nb, th, cf in neigh[s]:
+                    # allow crossing stronger creases for tiny shards but penalize it
+                    dmu = abs(mu[s] - mu[nb])
+                    bh  = _bhattacharyya_1d(mu[s], sig[s], mu[nb], sig[nb])
+                    crease_pen = max(0.0, (th - θ_keep)) / θ_keep
+                    conc_pen   = max(0.0, cf - concave_veto_frac)
+                    # prefer larger neighbor a bit (stability)
+                    size_bonus = -0.05 * np.log1p(size[nb])
+                    score = 2.0*dmu + 1.0*bh + 0.6*crease_pen + 0.3*conc_pen + size_bonus
+                    if score < best_score:
+                        best, best_score = nb, score
+                if best is not None:
+                    # merge island s -> best
+                    island_id[islands[s]] = best
+                    did_merge = True
+            if did_merge:
+                # rebuild islands after batch of small merges
+                new_ids = island_id.copy()
+                # compress ids to 0..R'-1
+                uniq, inv = np.unique(new_ids, return_inverse=True)
+                island_id = inv.astype(np.int64)
+                islands = [np.where(island_id == i)[0] for i in range(len(uniq))]
+                continue  # re-run passes with new structure
+
+        # ---- Pass B: similarity-based merges to reach target_islands
+        if target_islands is not None and R > max(1, target_islands):
+            cand = []
+            for (a, b), th, cf in zip(keys, thavg, concf):
+                if th > θ_keep and cf > concave_veto_frac:
+                    continue
+                dmu = abs(mu[a] - mu[b])
+                bh  = _bhattacharyya_1d(mu[a], sig[a], mu[b], sig[b])
+                if (dmu <= mu_tol) or (bh <= bhat_tol):
+                    score = 2.0*dmu + 1.0*bh + 0.25*(th/θ_keep)
+                    # bias toward absorbing the smaller into the larger
+                    a_big = size[a] >= size[b]
+                    cand.append((score, a if a_big else b, b if a_big else a))
+            if not cand:
+                break
+            # merge the single best pair and iterate
+            _, keep, drop = min(cand, key=lambda t: t[0])
+            island_id[islands[drop]] = keep
+            # compress & rebuild
+            uniq, inv = np.unique(island_id, return_inverse=True)
+            island_id = inv.astype(np.int64)
+            islands = [np.where(island_id == i)[0] for i in range(len(uniq))]
+            continue
+
+        # nothing to do this round
+        break
+
+    # Final: convert island ids back to compact labels
+    uniq, remap = np.unique(island_id, return_inverse=True)
+    return remap.astype(np.int32)
 
 # ---------------------------
 # Helpers
 # ---------------------------
 
-def robust_norm01(x: np.ndarray, q_lo=1.0, q_hi=99.0) -> np.ndarray:
-    lo, hi = np.percentile(x, [q_lo, q_hi])
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+def robust_norm01(x: np.ndarray, low_percentile=1.0, high_percentile=99.0) -> np.ndarray:
+    low, high = np.percentile(x, [low_percentile, high_percentile])
+    
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
         return np.zeros_like(x)
-    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+    
+    # Shift x so that low and high are clipped to one.
+    ZERO_SAFETY = 1e-9 # Prevents dividing by zero
+    return np.clip((x - low) / max(high - low, ZERO_SAFETY), 0.0, 1.0)
 
-def log_remap01(x: np.ndarray, alpha: float = 4.0) -> np.ndarray:
-    x = np.clip(x, 0.0, 1.0)
+def log_remap(x: np.ndarray, alpha: float = 4.0) -> np.ndarray:
     return np.log(x * alpha + 1.0) / np.log(alpha + 1.0)
 
 def random_label_colors(k, alpha=255, seed=42):
@@ -56,24 +452,6 @@ def sdf_to_heatmap(nsdf_face: np.ndarray, alpha: int = 255) -> np.ndarray:
     b = np.interp(t, pos, colB)
     rgba = np.stack([r, g, b, np.full_like(r, alpha)], axis=1)
     return np.clip(rgba, 0, 255).astype(np.uint8)
-
-
-# ---------------------------
-# SDF per face
-# ---------------------------
-
-def sdf_per_face(mesh: trimesh.Trimesh, rays: int = 128, flip: bool = False) -> np.ndarray:
-    V, F = mesh.vertices, mesh.faces
-    C = mesh.triangles_center
-    Nf = mesh.face_normals
-    if flip:
-        Nf = -Nf
-    sdf = shape_diameter_function(V, F, C, Nf, rays)  # ~[0,1]
-    sdf = np.nan_to_num(sdf, nan=np.nanmedian(sdf))
-    return sdf.astype(np.float64)
-
-def sdf_per_face_stable(mesh: trimesh.Trimesh, rays: int = 128) -> np.ndarray:
-    return sdf_per_face(mesh, rays=rays, flip=False)
 
 # ---------------------------
 # Step 1: GMM posteriors (soft labels)
@@ -270,25 +648,44 @@ def signed_dihedral_angles(mesh: trimesh.Trimesh) -> np.ndarray:
 
 def dihedral_edge_term(mesh: trimesh.Trimesh,
                        *, eps: float = 1e-12,
-                       pairwise_floor: float = 0.0,
-                       edge_len_power: float = 0.0,
-                       concavity_bias: float = 1.0):
+                       pairwise_floor: float = 1.0,
+                       edge_len_power: float = 1.0,
+                       concavity_bias: float = 1.0,
+                       crease_power: float = 1.6,
+                       theta_clip_deg: float = 2.0):
+    """
+    Higher crease_power -> much stronger penalty to cut across flat areas,
+    much weaker near creases. pairwise_floor keeps a base smoothness everywhere.
+    """
     E = mesh.face_adjacency.astype(np.int32)
     if E.size == 0:
         return E, np.empty((0,), np.float64)
-    theta = mesh.face_adjacency_angles
-    w = -np.log((theta / np.pi) + eps)
-    if pairwise_floor > 0.0:
-        w = pairwise_floor + w
+
+    theta = mesh.face_adjacency_angles.copy()
+    # clip tiny angles to avoid infinity in -log
+    theta = np.clip(theta, np.deg2rad(theta_clip_deg), np.pi)
+
+    # base Shapira: large on flat, small near crease
+    w = -np.log((theta / np.pi) + eps)     # [~0, +inf) as theta->pi..0
+    w = pairwise_floor + w
+
+    # emphasize angle contrast
+    if crease_power != 1.0:
+        w = w ** float(crease_power)
+
+    # optional concavity/convexity bias
     if concavity_bias != 1.0:
         theta_s = signed_dihedral_angles(mesh)
         concave = theta_s < 0.0
         w[concave] *= float(concavity_bias)
+
+    # length modulation (discourages tiny “chatter” cuts)
     if edge_len_power != 0.0:
         se = mesh.face_adjacency_edges
         el = np.linalg.norm(mesh.vertices[se[:, 0]] - mesh.vertices[se[:, 1]], axis=1)
         el = (el / (el.mean() + 1e-12)) ** float(edge_len_power)
         w *= el
+
     return E, w.astype(np.float64)
 
 # ---------------------------
@@ -296,49 +693,209 @@ def dihedral_edge_term(mesh: trimesh.Trimesh,
 # ---------------------------
 
 def shapira08_graph_cut(unary_e1: np.ndarray, edges: np.ndarray, w_edge: np.ndarray,
-                        lam: float, add_eps: bool = True) -> np.ndarray:
+                        lam: float, add_eps: bool = True, unary_weight: float = 1.0) -> np.ndarray:
+    """
+    Energy: sum_f (unary_weight * U_f) + lam * sum_(f,g) w_fg [l_f != l_g]
+    Set unary_weight < 1 to rely less on SDF; > 1 to rely more.
+    """
     N, K = unary_e1.shape
     E = edges.astype(np.int32)
+
     U = unary_e1.astype(np.float64)
-    U -= U.min(axis=1, keepdims=True)
+    U -= U.min(axis=1, keepdims=True)     # stabilize scale
     if add_eps:
         U += (1e-9 * np.arange(K, dtype=np.float64))[None, :]
+    U *= float(unary_weight)               # << dial SDF influence
+
     W = (lam * w_edge).astype(np.float64)
-    V = (1.0 - np.eye(K, dtype=np.float64))
+    V = (1.0 - np.eye(K, dtype=np.float64))   # Potts
     labels = gco.cut_general_graph(E, W, U, V, algorithm="expansion")
     return labels.astype(np.int32)
-
 # ---------------------------
 # Single-mesh pipeline (EXACT Shapira08)
 # ---------------------------
 
-def segment_mesh_shapira08_exact(mesh: trimesh.Trimesh,
-                                       *,
-                                       k_min=1, k_max=4,
-                                       rays=128, auto_lambda_ratio=1,
-                                       k_method="bic", min_faces_per_cluster=250,
-                                       debug=False, lam=None):
-    mesh.fix_normals()
-    sdf_f = sdf_per_face_stable(mesh, rays=rays)
-    nsdf_f = log_remap01(robust_norm01(sdf_f, 1, 99), alpha=4.0)
+def gmm_unary_fixed(nsdf_face: np.ndarray, k: int, eps: float = 1e-12):
+    """
+    Fit a 1D GaussianMixture with FIXED k on nsdf_face and return unary = -log P.
+    Robust quantile seeding; auto-downgrades if not enough faces or variance ~ 0.
+    """
+    x = nsdf_face.reshape(-1, 1).astype(np.float64)
+    F = x.shape[0]
+    if F == 0:
+        return np.zeros((0, 1)), 1
 
-    # cap K for small parts so each cluster has enough faces
+    # If the component is too small or nearly constant, just return one label
+    if F < 2 or float(np.std(x)) < 1e-8:
+        return np.zeros((F, 1), dtype=np.float64), 1
+
+    k_eff = int(max(1, min(k, F)))  # ensure k ≤ faces
+    # robust means init at quantiles (5..95%)
+    qs = np.linspace(5.0, 95.0, k_eff)
+    means_init = np.percentile(x.ravel(), qs).reshape(-1, 1)
+
+    gm = GaussianMixture(
+        n_components=k_eff,
+        covariance_type="full",
+        n_init=1,                 # we seed => no need for multiple inits
+        max_iter=200,
+        random_state=0,
+        means_init=means_init
+    ).fit(x)
+
+    P = np.clip(gm.predict_proba(x), eps, 1.0)        # (F, k_eff)
+    U = -np.log(P)
+    return U, k_eff
+
+def _boundary_vertices_from_faces(F: np.ndarray) -> np.ndarray:
+    E = np.vstack([F[:,[0,1]], F[:,[1,2]], F[:,[2,0]]])
+    E = np.sort(E, axis=1)
+    view = np.ascontiguousarray(E).view([('u', E.dtype), ('v', E.dtype)])
+    uniq, cnt = np.unique(view, return_counts=True)
+    E1 = uniq.view(E.dtype).reshape(-1,2)[cnt==1]
+    return np.unique(E1.ravel())
+
+def _vertex_geodesic_from_sources(V, F, sources):
+    ii = np.hstack([F[:,0], F[:,1], F[:,2]])
+    jj = np.hstack([F[:,1], F[:,2], F[:,0]])
+    ww = np.linalg.norm(V[ii] - V[jj], axis=1)
+    G  = sp.coo_matrix((ww, (ii, jj)), shape=(len(V), len(V)))
+    G  = (G + G.T).tocsr()
+    from scipy.sparse.csgraph import dijkstra
+    D = dijkstra(G, directed=False, indices=sources, return_predecessors=False)
+    return np.asarray(D).min(axis=0)
+
+def boundary_confidence_faces(mesh: trimesh.Trimesh,
+                              inner=None, outer=None, gamma=2.0) -> np.ndarray:
+    """Per-face confidence c in [0,1]: 0 near open boundary, 1 inside."""
+    V = np.asarray(mesh.vertices); F = np.asarray(mesh.faces, np.int64)
+    # auto distances from median edge length if not given
+    eidx = np.vstack([F[:,[0,1]], F[:,[1,2]], F[:,[2,0]]])
+    med_e = float(np.median(np.linalg.norm(V[eidx[:,0]]-V[eidx[:,1]], axis=1)))
+    if inner is None: inner = 2.0 * med_e
+    if outer is None: outer = 10.0 * med_e
+
+    bverts = _boundary_vertices_from_faces(F)
+    if bverts.size == 0:
+        return np.ones(len(F), dtype=np.float64)
+
+    dV = _vertex_geodesic_from_sources(V, F, bverts)
+    dF = dV[F].mean(axis=1)
+
+    t = np.clip((dF - inner) / max(outer - inner, 1e-9), 0.0, 1.0)
+    c = t*t*(3-2*t)            # smoothstep
+    return np.power(c, float(gamma))  # sharpen confidence falloff
+
+# ---------- angle-aware Laplacian on faces ----------
+def face_laplacian(mesh: trimesh.Trimesh,
+                   sigma_angle_deg=40.0,
+                   theta_stop_deg=85.0,
+                   edge_len_power=0.5) -> sp.csr_matrix:
+    Fcount = len(mesh.faces)
+    if Fcount == 0:
+        return sp.csr_matrix((0,0))
+    E = np.asarray(mesh.face_adjacency, np.int64).reshape(-1,2)
+    theta = np.asarray(mesh.face_adjacency_angles, np.float64)
+    # weights: high on flat, near zero across strong creases
+    sig = np.deg2rad(max(1e-3, sigma_angle_deg))
+    w = np.exp(-(theta/sig)**2)
+    w[theta > np.deg2rad(theta_stop_deg)] = 0.0
+    if edge_len_power != 0.0:
+        eidx = np.asarray(mesh.face_adjacency_edges, np.int64)
+        el = np.linalg.norm(mesh.vertices[eidx[:,0]]-mesh.vertices[eidx[:,1]], axis=1)
+        el = (el/ (el.mean()+1e-12)) ** float(edge_len_power)
+        w *= el
+    i, j = E[:,0], E[:,1]
+    W = sp.coo_matrix((w, (i, j)), shape=(Fcount, Fcount)).tocsr()
+    W = W + W.T
+    d = np.array(W.sum(axis=1)).ravel()
+    L = sp.diags(d) - W
+    return L
+
+# ---------- main smoother/blender ----------
+def smooth_blend_sdf(mesh: trimesh.Trimesh, sdf: np.ndarray,
+                     *,
+                     smooth_time=8.0,                 # ↑ stronger smoothing
+                     sigma_angle_deg=40.0,
+                     theta_stop_deg=85.0,
+                     edge_len_power=0.5,
+                     inner=None, outer=None, gamma=2.0,  # boundary confidence
+                     neutral='median') -> np.ndarray:
+    """Solve (C + t L) x = C s  ; C = diag(confidence) from boundary distance."""
+    s = np.asarray(sdf, np.float64)
     F = len(mesh.faces)
-    k_cap = max(k_min, min(k_max, max(1, F // max(1, min_faces_per_cluster))))
+    if F == 0: return s.copy()
 
-    U, K = gmm_unary_auto(nsdf_f, k_min=k_min, k_max=k_cap,
-                          method=k_method,
-                          min_comp_frac=max(1.0/F, 1.0/min_faces_per_cluster))
+    # 1) confidence (low near open boundaries)
+    conf = boundary_confidence_faces(mesh, inner=inner, outer=outer, gamma=gamma)
+
+    # 2) optionally blend input toward neutral near boundary before smoothing
+    if neutral == 'median':
+        base = float(np.nanmedian(s))
+    elif neutral == 'min':
+        base = float(np.nanmin(s))
+    elif neutral == 'max':
+        base = float(np.nanmax(s))
+    else:
+        base = float(neutral)
+    s0 = conf * s + (1.0 - conf) * base
+
+    # 3) Laplacian
+    L = face_laplacian(mesh, sigma_angle_deg, theta_stop_deg, edge_len_power)
+
+    # 4) Solve (C + tL) x = C*s0
+    C = sp.diags(conf)
+    A = C + smooth_time * L
+    b = C @ s0
+    x = spla.spsolve(A.tocsr(), b)
+    return np.asarray(x)
+
+def segment_mesh_shapira08_fixed_k(mesh: trimesh.Trimesh,
+                                   *,
+                                   k: int = 3,
+                                   rays: int = 24,
+                                   lam: float | None = None,
+                                   auto_lambda_ratio: float = 0.3,
+                                   debug: bool = False):
+    """
+    Shapira08: SDF (cone=120°) -> log-remapped nsdf -> GMM(K fixed) -> α-expansion (dihedral Potts)
+    """
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    F = np.asarray(mesh.faces,    dtype=np.int32)
+
+    # SDF with the CGAL-backed module you built (preserves face order)
+    sdf  = sdf120.compute_sdf(V, F, rays=rays, cone_deg=120.0, postprocess=True)
+    # After computing SDF and mapping to [0,1]
+    sdf01 = np.clip((sdf - np.percentile(sdf,1)) /
+                    max(np.percentile(sdf,99)-np.percentile(sdf,1),1e-9), 0, 1)
+
+    # Stronger smoothing & stronger boundary blend:
+    sdf_s = smooth_blend_sdf(
+        mesh, sdf01,
+        smooth_time=12.0,        # try 8 → 12 → 20 for more smoothing
+        sigma_angle_deg=50.0,    # wider angular kernel (smoother)
+        theta_stop_deg=88.0,     # allow smoothing across mild creases
+        edge_len_power=1.0,
+        inner=None, outer=None,  # auto from median edge length
+        gamma=2.5,               # more aggressive “confidence” drop near boundary
+        neutral='median'
+    )
+
+
+    nsdf_f = log_remap(robust_norm01(sdf_s, 1, 99), alpha=4.0)
+
+    # Fixed-K unary
+    U, k_eff = gmm_unary_fixed(nsdf_f, k=k)
     if debug:
-        print(f"[auto-K] F={F} -> K={K} (cap={k_cap})")
+        print(f"[fixed-K] requested K={k}, used K={k_eff}, faces={len(F)}")
 
-    if K <= 1:
-        # trivial: everything one label, still return nsdf for viz
-        return np.zeros(F, np.int32), nsdf_f, 0.0
+    if k_eff <= 1:
+        return np.zeros(len(mesh.faces), np.int32), nsdf_f, 0.0
 
+    # Dihedral Potts weights (penalize label changes on flat areas, allow on creases)
     edges, w = dihedral_edge_term(mesh)
 
-    # auto λ if not given
+    # λ: same simple rule as before if not provided
     if lam is None:
         U0 = U - U.min(axis=1, keepdims=True)
         delta = float(np.median(U0.max(axis=1))) if U0.size else 0.0
@@ -347,8 +904,15 @@ def segment_mesh_shapira08_exact(mesh: trimesh.Trimesh,
         lam = 0.0 if (delta <= 0 or deg <= 0 or wmean <= 0) else delta / (auto_lambda_ratio * deg * wmean)
 
     labels = shapira08_graph_cut(U, edges, w, lam, add_eps=True)
+    # labels = merge_label_islands(
+    #     mesh, 
+    #     labels, 
+    #     nsdf_f,
+    #     min_region_faces=150,       # force-merge shards
+    #     theta_keep_deg=65.0,        # don’t cross very strong creases
+    #     mu_tol=None, bhat_tol=None  # auto thresholds from data
+    # )
     return labels.astype(np.int32), nsdf_f, lam
-
 
 # ---------------------------
 # NEW: split into connected face components and segment each
@@ -392,8 +956,8 @@ def split_face_components(mesh: trimesh.Trimesh):
         out.append((sub, comp))
     return out
 
-def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None = None,
-                           rays: int = 64, auto_lambda_ratio: float = 0.3,
+def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None,
+                           rays: int = 24, auto_lambda_ratio: float = 0.3,
                            debug: bool = False):
     """
     Split the mesh into connected face-components, segment each,
@@ -415,7 +979,7 @@ def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None = None,
         
         if debug:
             print(f"[part {si}] faces={len(orig_idx)}")
-        labels_sub, nsdf_sub, _ = segment_mesh_shapira08_exact(
+        labels_sub, nsdf_sub = segment_mesh_iterative_gc(
             sub, lam=lam, rays=rays, auto_lambda_ratio=auto_lambda_ratio, debug=debug
         )
         # reindex labels to be unique across parts
@@ -436,9 +1000,15 @@ def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None = None,
 # ---------------------------
 # CLI / Viewer
 # ---------------------------
+
 def main():
     ap = argparse.ArgumentParser(description="EXACT Shapira08 SDF+GMM+k-way graph cut (per connected component)")
     ap.add_argument("input", help="path to mesh (.obj/.ply/...)")
+    ap.add_argument("--lambda_ratio", type=float, default=0.3,
+                    help="λ for the pairwise term. If omitted, λ is auto-chosen.")
+    ap.add_argument("--lam", type=float, default=None,
+                    help="λ for the pairwise term. If omitted, λ is auto-chosen.")
+    ap.add_argument("--rays", type=int, default=30)
     ap.add_argument("--viz", choices=["labels", "sdf"], default="labels",
                     help="What to visualize: segmentation labels or SDF heatmap.")
     ap.add_argument("--no-split", action="store_true",
@@ -449,10 +1019,22 @@ def main():
     args = ap.parse_args()
 
     mesh = trimesh.load_mesh(args.input, process=False)
+    mesh.remove_unreferenced_vertices()
+    mesh.remove_infinite_values()
     mesh.merge_vertices(merge_tex=True, merge_norm=True)
-    mesh.fix_normals()
 
-    labels, nsdf = segment_per_components(mesh)
+    if args.no_split:
+        labels, nsdf = segment_mesh_iterative_gc(
+            mesh, lam=args.lam, rays=args.rays, debug=args.debug
+        )
+    else:
+        labels, nsdf = segment_per_components(
+            mesh, 
+            lam=args.lam, 
+            rays=args.rays, 
+            auto_lambda_ratio=args.lambda_ratio, 
+            debug=args.debug
+        )
 
     export_label_components(mesh, labels, args.output)
 

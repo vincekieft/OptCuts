@@ -1,6 +1,9 @@
 import argparse
 import os
+import shutil
 import signal
+import subprocess
+import tempfile
 import numpy as np
 import xatlas
 import time
@@ -230,6 +233,18 @@ def extract_label_components(mesh: trimesh.Trimesh, labels: np.ndarray, *, min_f
         if len(comp) >= min_faces:
             yield lab, np.asarray(comp, dtype=np.int64)
 
+def resolve_absolute_path(path: str) -> str:
+    script_dir = Path(__file__).resolve().parent
+    exe_path = Path(path).expanduser()
+    if not exe_path.is_absolute():
+        exe_path = (script_dir / exe_path).resolve()
+        
+    if not exe_path.exists():
+        raise FileNotFoundError(
+            f"OptCuts binary not found. Passed '{path}', resolved to '{exe_path}'")
+        
+    return exe_path
+
 def run_optcuts_and_project(mesh: trimesh.Trimesh,
                             labels: np.ndarray,
                             *,
@@ -243,14 +258,7 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
     Split -> run OptCuts per part (with timeout) -> project UVs back.
     If OptCuts fails or times out, fall back to xatlas for that part.
     """
-    script_dir = Path(__file__).resolve().parent
-    exe_path = Path(exe).expanduser()
-    if not exe_path.is_absolute():
-        exe_path = (script_dir / exe_path).resolve()
-        
-    if not exe_path.exists():
-        raise FileNotFoundError(
-            f"OptCuts binary not found. Passed '{exe}', resolved to '{exe_path}'")
+    exe_path = resolve_absolute_path(exe)
         
     F_total = mesh.faces.shape[0]
     uv_face_corner = np.full((F_total, 3, 2), np.nan, dtype=np.float64)
@@ -278,7 +286,13 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
 
         # Run OptCuts with cwd=workdir so its "output/..." lands inside this job folder
         cmd = [str(exe_path), "100", str(obj_path), "0.999", "1", "0", "4.1", "1", "0"]
-        pop = subprocess.Popen(cmd, start_new_session=True, cwd=workdir)
+        pop = subprocess.Popen(
+            cmd, 
+            start_new_session=True, 
+            cwd=workdir,
+            stdout=subprocess.DEVNULL,          # <-- swallow stdout
+            stderr=subprocess.DEVNULL           # <-- swallow stderr
+        )
         meta = {
             "pi": pi, "lab": lab, "face_ids": face_ids,
             "workdir": workdir, "obj_path": obj_path, "start": time.time()
@@ -397,6 +411,83 @@ def run_optcuts_and_project(mesh: trimesh.Trimesh,
 
     return uv_face_corner
 
+def _assert_has_uv(mesh: trimesh.Trimesh):
+    uv = getattr(mesh.visual, "uv", None)
+    if uv is None:
+        raise ValueError("mesh has no per-vertex UVs; run bake_uvs_with_vertex_splits first")
+    return uv
+
+def pack_with_xapack_cli(
+    merged_mesh: trimesh.Trimesh,
+    *,
+    exe: str | Path,              # path to your compiled xapack binary
+    resolution: int = 2048,
+    padding_px: int = 8,
+    rotate: bool = True,
+    brute: bool = False,          # xapack optional last arg (if you enabled it)
+    timeout_sec: float = 120.0,
+    keep_artifacts: bool = False,
+) -> trimesh.Trimesh:
+    """
+    Export `merged_mesh` (already has final islands/UVs), call xapack (pack-only),
+    re-import the packed OBJ, and return it as a new trimesh. Raises on failure.
+    """
+    _assert_has_uv(merged_mesh)
+
+    exe_path = Path(exe).expanduser().resolve()
+    if not exe_path.exists():
+        raise FileNotFoundError(f"xapack binary not found: {exe_path}")
+
+    tmp = tempfile.TemporaryDirectory(prefix="xapack_")
+    tdir = Path(tmp.name)
+    in_obj  = tdir / "in_with_uv.obj"
+    out_obj = tdir / "out_packed.obj"
+
+    # Write the mesh as OBJ (triangles, per-vertex UVs)
+    merged_mesh.export(in_obj, file_type="obj")
+
+    # xapack usage: xapack in.obj out.obj <resolution> <padding_px> <rotate0|1> [texelsPerUnit] [brute0|1]
+    # We pass tpu=0 to keep our existing density (you’re already doing uniform scaling upstream).
+    cmd = [
+        str(exe_path),
+        str(in_obj),
+        str(out_obj),
+        str(int(resolution)),
+        str(int(padding_px)),
+        "1" if rotate else "0",
+        "0",                                 # texelsPerUnit = 0 (preserve scale)
+    ]
+    if brute:
+        cmd.append("1")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        tmp.cleanup()
+        raise TimeoutError(f"xapack timed out after {timeout_sec:.1f}s")
+
+    if proc.returncode != 0 or not out_obj.exists():
+        err = proc.stderr.decode(errors="ignore")
+        tmp.cleanup()
+        raise RuntimeError(f"xapack failed (exit {proc.returncode}). Stderr:\n{err}")
+
+    packed = trimesh.load_mesh(out_obj, process=False)
+
+    if keep_artifacts:
+        # keep the OBJ beside your script for inspection
+        saved = Path.cwd() / out_obj.name
+        shutil.copy2(out_obj, saved)
+        print(f"[xapack] saved packed OBJ -> {saved}")
+
+    tmp.cleanup()
+    return packed
+
 def bake_uvs_with_vertex_splits(original_mesh: trimesh.Trimesh,
                                 uv_face_corner: np.ndarray,
                                 *,
@@ -434,25 +525,37 @@ def main():
     ap.add_argument("input", help="path to mesh (.obj/.ply/...)")
     ap.add_argument("--output", default="out", help="output directory")
     ap.add_argument("--exe", "-e", default="build/OptCuts_bin", help="Path to OptCuts binary")
+    ap.add_argument("--packer_exe", "-pe", default="ext/xatlas/build/xapack", help="Path to packer")
     args = ap.parse_args()
     
     mesh = trimesh.load_mesh(args.input, process=False)
     mesh.merge_vertices(merge_tex=True, merge_norm=True)
-    mesh.fix_normals()
 
-    labels, _ = segment_per_components(mesh)
+    labels0, prob = segment_per_components(mesh)
+    
+    # Make unaries (optional but best):
+    if prob is not None:
+        unary = -np.log(np.clip(prob, 1e-9, 1.0))
+    else:
+        unary = None
+
+    labels = refine_labels_length_potts(
+        mesh, labels0,
+        unary_neglog=unary, lam=12.0, beta_sharp=1.5, stick=2.0
+    )
     
     export_label_components(mesh, labels, args.output)
     
     uv_face_corner = run_optcuts_and_project(mesh, labels, exe=args.exe, timeout_sec=60.0)
     merged = bake_uvs_with_vertex_splits(mesh, uv_face_corner)
-    # repacked = repack_with_xatlas(merged)
+    
+    packed = pack_with_xapack_cli(merged, exe=resolve_absolute_path(args.packer_exe))
     
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / (Path(args.input).stem + "_with_uv.obj")
-    merged.export(out_path, file_type="obj")
-    print(f"[merge] Wrote merged OBJ with UVs -> {out_path}")
+    packed.export(out_path, file_type="obj")
+    print(f"[merge] Wrote packed OBJ with UVs -> {out_path}")
 
 
 if __name__ == "__main__":

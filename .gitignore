@@ -7,3 +7,4 @@ output/
 ext/tbb/
 ext/.cache
 .venv
+out
