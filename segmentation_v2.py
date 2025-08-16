@@ -1,19 +1,20 @@
 import argparse
 import sys
 import gco
+import igl
 import pyrender
 from sklearn.mixture import GaussianMixture; sys.path.append('./sdf120/build')
 import sdf120
 import trimesh
 import numpy as np
 import tkinter as tk
-from helpers import label_probs_to_colors, sdf_to_colors, labels_to_colors
+from helpers import calculate_face_directions, curvature_direction_lines, inpaint_sdf_nans, label_probs_to_colors, sdf_to_colors, labels_to_colors, smooth_blend_sdf
 
 # Some pyrenderer error about removed infty
 if not hasattr(np, "infty"):
     np.infty = np.inf
 
-def log_remap(x: np.ndarray, alpha: float = 3.0) -> np.ndarray:
+def log_remap(x: np.ndarray, alpha: float = 1.0) -> np.ndarray:
     """
     Remaps x to log with a controllable alpha knob.
     Alpha = 0, almost linear
@@ -23,7 +24,7 @@ def log_remap(x: np.ndarray, alpha: float = 3.0) -> np.ndarray:
     """
     return np.log(x * alpha + 1.0) / np.log(alpha + 1.0)
 
-def robust_norm01(x: np.ndarray, low_percentile=5.0, high_percentile=95.0) -> np.ndarray:
+def robust_norm01(x: np.ndarray, low_percentile=1.0, high_percentile=99.0) -> np.ndarray:
     """
     Safe normalizes x between zero and one cliping of 1 and 99 percentile highs and lows
     """
@@ -35,6 +36,8 @@ def robust_norm01(x: np.ndarray, low_percentile=5.0, high_percentile=95.0) -> np
     # Shift x so that low and high are clipped to one.
     ZERO_SAFETY = 1e-9 # Prevents dividing by zero
     return np.clip((x - low) / max(high - low, ZERO_SAFETY), 0.0, 1.0)
+
+
 
 def calculate_nsdf(
     mesh: trimesh.Trimesh,
@@ -50,6 +53,10 @@ def calculate_nsdf(
     
     CONE_DEGREES = 120.0
     sdf  = sdf120.compute_sdf(vertices, faces, rays=rays, cone_deg=CONE_DEGREES, postprocess=True)
+    if not np.isfinite(sdf).all():
+        sdf = inpaint_sdf_nans(mesh, sdf)
+        
+    # smooth_sdf = smooth_blend_sdf(mesh, sdf)
     return log_remap(robust_norm01(sdf))
 
 def gaussian_mixture(nsdf: np.ndarray, k: int):
@@ -96,14 +103,38 @@ def graph_cut(probabilities: np.ndarray, edges: np.ndarray, edge_weights: np.nda
 def face_adjacency(mesh: trimesh.Trimesh) -> np.ndarray:
     return mesh.face_adjacency.astype(np.int32)
 
-def calculate_edge_weights(mesh: trimesh.Trimesh) -> np.ndarray:
+def calculate_edge_weights(
+    mesh: trimesh.Trimesh,
+    face_directions: np.ndarray,
+    *,
+    dir_power: float = 2.0 # >1 emphasizes strong alignment
+) -> np.ndarray:
+    vertices = mesh.vertices
+    adjacency_edges = mesh.face_adjacency_edges
+    face_adjacency = mesh.face_adjacency
+    
     # 0 .. pi where 0 means flat and pi means faces are almost flipped relative to each other
     adjacency_angles = mesh.face_adjacency_angles.copy()
     
     # invert/normalize to make flat 1.0 and sharp 0
     edge_weights = 1.0 - (adjacency_angles / np.pi) # invert to
     
-    return edge_weights.astype(np.float64)
+    # Edge unit vectors
+    evec = vertices[adjacency_edges[:, 1]] - vertices[adjacency_edges[:, 0]]
+    elen = np.linalg.norm(evec, axis=1)
+    En   = np.zeros_like(evec)
+    nz   = elen > 1e-12
+    En[nz] = evec[nz] / elen[nz, None]
+
+    # Alignment with both adjacent faces (signless)
+    d0 = face_directions[face_adjacency[:, 0]]
+    d1 = face_directions[face_adjacency[:, 1]]
+    a0 = np.abs(np.einsum('ij,ij->i', En, d0))
+    a1 = np.abs(np.einsum('ij,ij->i', En, d1))
+    align = 0.5 * (a0 + a1)                      # 0..1
+    dir_factor = np.clip(align, 0.0, 1.0) ** float(dir_power)
+    
+    return (edge_weights * dir_factor).astype(np.float64)
 
 def load_mesh(path: str) -> trimesh.Trimesh:
     mesh = trimesh.load_mesh(path, process=False)
@@ -112,32 +143,88 @@ def load_mesh(path: str) -> trimesh.Trimesh:
     mesh.merge_vertices(merge_tex=True, merge_norm=True)
     return mesh
 
+def split_face_components(mesh: trimesh.Trimesh):
+    """
+    Returns a list of (submesh, orig_face_idx) where orig_face_idx are indices
+    into the *original* mesh.faces.
+    """
+    face_count = len(mesh.faces)
+    if face_count == 0:
+        return []
+
+    # build adjacency lists
+    adj = [[] for _ in range(face_count)]
+    for a, b in mesh.face_adjacency:
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+
+    visited = np.zeros(face_count, dtype=bool)
+    comps = []
+    
+    # flood fill until all faces are covered
+    for i in range(face_count):
+        if visited[i]:
+            continue
+        
+        visited[i] = True
+        stack = [i]
+        comp = []
+        
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    stack.append(v)
+        
+        comps.append(np.asarray(comp, dtype=np.int64))
+
+    # make submeshes
+    out = []
+    for comp in comps:
+        sub = mesh.submesh([comp], append=True, repair=False)
+        out.append((sub, comp))
+    
+    return out
+
+def segment_per_components(mesh: trimesh.Trimesh):
+    face_count = len(mesh.faces)
+    global_labels = np.full(face_count, -1, np.int32)
+    global_nsdf   = np.zeros(face_count, np.float64)
+    
+    parts = split_face_components(mesh)
+    
+    for part_index, (sub, orig_idx) in enumerate(parts):
+        if sub.faces.shape[0] <= 1: 
+            continue
+        
+        
+
 def show_viewer(
     mesh: trimesh.Trimesh,
     sdf: np.ndarray,
     probabilities: np.ndarray,
-    labels: np.ndarray
+    labels: np.ndarray,
+    face_directions: np.ndarray,
 ):
     label_colors = labels_to_colors(labels)
     sdf_colors = sdf_to_colors(sdf)
     prob_colors = label_probs_to_colors(probabilities, gamma_correct=True)
     
-    # Different visualizations
-    mesh_sdf   = mesh.copy()
-    mesh_sdf.visual = trimesh.visual.ColorVisuals(mesh=mesh, face_colors=sdf_colors)
-    pr_sdf = pyrender.Mesh.from_trimesh(mesh_sdf, smooth=False)
-
-    mesh_probs   = mesh.copy()
-    mesh_probs.visual = trimesh.visual.ColorVisuals(mesh=mesh, face_colors=prob_colors)
-    pr_probs = pyrender.Mesh.from_trimesh(mesh_probs, smooth=False)
+    def pr_from_colors(colors):
+        m = mesh.copy(); 
+        m.visual = trimesh.visual.ColorVisuals(mesh=mesh, face_colors=colors)
+        return pyrender.Mesh.from_trimesh(m, smooth=False)
     
-    mesh_labels = mesh.copy()
-    mesh_labels.visual = trimesh.visual.ColorVisuals(mesh=mesh, face_colors=label_colors)
-    pr_labels = pyrender.Mesh.from_trimesh(mesh_labels, smooth=False)
+    # Different visualizations
+    pr_sdf = pr_from_colors(sdf_colors)
+    pr_probs = pr_from_colors(prob_colors)
+    pr_labels = pr_from_colors(label_colors)
+    
+    pr_curvline = curvature_direction_lines(mesh, face_directions, scale=0.6, every=3, color=(1,0,0,1))
 
     scene = pyrender.Scene(bg_color=(240, 240, 240, 255), ambient_light=np.ones(3))
-    node = scene.add(pr_sdf) # Start with SDF view
-    
     viewer = pyrender.Viewer(
         scene=scene,
         viewport_size=(1000, 800),
@@ -145,31 +232,39 @@ def show_viewer(
         run_in_thread=True,              # << key bit: don’t block, allow UI thread
     )
     
-    current = {'node': node, 'mode': 'sdf'}
-    meshes  = {'sdf': pr_sdf, 'probs': pr_probs, 'labels': pr_labels}
+    current = {'node': None, 'mode': 'sdf'}
     
-    def switch(mode: str):
-        if current['mode'] == mode:
-            return
-        # Thread-safe scene mutation while viewer is running
+    # view modes can be one or multiple nodes
+    modes = {
+        'sdf'       : [pr_sdf],
+        'probs'     : [pr_probs],
+        'labels'    : [pr_labels],
+        'curv_lines': [pr_sdf, pr_curvline],   # overlay lines on SDF (pick any base)
+    }
+
+    current = {'mode': None, 'nodes': []}
+
+    def switch(mode):
+        if current['mode'] == mode: return
         viewer.render_lock.acquire()
         try:
-            scene.remove_node(current['node'])
-            current['node'] = scene.add(meshes[mode])
-            current['mode'] = mode
+            for nd in current['nodes']:
+                scene.remove_node(nd)
+            current['nodes'] = [scene.add(m) for m in modes[mode]]
+            current['mode']  = mode
         finally:
             viewer.render_lock.release()
 
+    switch('sdf') # default to sdf
+    
     root = tk.Tk()
     root.title("Viewer mode")
 
-    btn1 = tk.Button(root, text="Show SDF",    command=lambda: switch('sdf'))
-    btn2 = tk.Button(root, text="Show Label Probs", command=lambda: switch('probs'))
-    btn3 = tk.Button(root, text="Show Labels", command=lambda: switch('labels'))
-    btn1.pack(fill='x', padx=10, pady=6)
-    btn2.pack(fill='x', padx=10, pady=6)
-    btn3.pack(fill='x', padx=10, pady=6)
-
+    tk.Button(root, text="Show SDF", command=lambda: switch('sdf')).pack(fill='x', padx=10, pady=6)
+    tk.Button(root, text="Show Label Probs", command=lambda: switch('probs')).pack(fill='x', padx=10, pady=6)
+    tk.Button(root, text="Show Labels", command=lambda: switch('labels')).pack(fill='x', padx=10, pady=6)
+    tk.Button(root, text="Curv Lines", command=lambda: switch('curv_lines')).pack(fill='x', padx=10, pady=6)
+     
     root.mainloop()
 
 def main():
@@ -179,14 +274,15 @@ def main():
 
     mesh = load_mesh(args.input)
     
+    face_directions = calculate_face_directions(mesh)
     nsdf = calculate_nsdf(mesh)
     probs = gaussian_mixture(nsdf, 3)
     edges = face_adjacency(mesh)
-    edge_weights = calculate_edge_weights(mesh)
+    edge_weights = calculate_edge_weights(mesh, face_directions)
     
     labels = graph_cut(probs, edges, edge_weights)
     
-    show_viewer(mesh, nsdf, probs, labels)
+    show_viewer(mesh, nsdf, probs, labels, face_directions)
 
 if __name__ == "__main__":
     main()
