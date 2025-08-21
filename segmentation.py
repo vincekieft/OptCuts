@@ -171,7 +171,7 @@ def _best_single_label_energy(U: np.ndarray) -> float:
     # no pairwise term if single label everywhere
     return float(U.sum(axis=0).min())
 
-def segment_mesh_iterative_gc(mesh: trimesh.Trimesh,
+def segment_mesh_itterative_gc(mesh: trimesh.Trimesh,
                               *,
                               rays: int = 30,
                               k0: int = 2,
@@ -250,7 +250,8 @@ def _islands_from_labels(mesh: trimesh.Trimesh, labels: np.ndarray):
                     stack.append(v)
         islands.append(np.asarray(comp, dtype=np.int64))
         cur += 1
-    return island_id, islands  # len(islands)=R
+    
+    return islands
 
 def _rag_between_islands(mesh: trimesh.Trimesh, island_id: np.ndarray):
     """Build adjacency & boundary stats between islands."""
@@ -979,6 +980,7 @@ def segment_per_components(mesh: trimesh.Trimesh, *, lam: float | None,
         
         if debug:
             print(f"[part {si}] faces={len(orig_idx)}")
+        
         labels_sub, nsdf_sub = segment_mesh_iterative_gc(
             sub, lam=lam, rays=rays, auto_lambda_ratio=auto_lambda_ratio, debug=debug
         )

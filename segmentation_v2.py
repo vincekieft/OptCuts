@@ -1,14 +1,22 @@
 import argparse
 import sys
 import gco
-import igl
 import pyrender
 from sklearn.mixture import GaussianMixture; sys.path.append('./sdf120/build')
 import sdf120
 import trimesh
 import numpy as np
 import tkinter as tk
-from helpers import calculate_face_directions, curvature_direction_lines, inpaint_sdf_nans, label_probs_to_colors, sdf_to_colors, labels_to_colors, smooth_blend_sdf
+from scipy.sparse import coo_matrix
+from helpers import (
+    calculate_face_directions,
+    curvature_direction_lines, 
+    inpaint_sdf,
+    sdf_to_colors, 
+    labels_to_colors,
+    smooth_blend_sdf
+)
+from scipy.sparse.csgraph import connected_components
 
 # Some pyrenderer error about removed infty
 if not hasattr(np, "infty"):
@@ -37,9 +45,7 @@ def robust_norm01(x: np.ndarray, low_percentile=1.0, high_percentile=99.0) -> np
     ZERO_SAFETY = 1e-9 # Prevents dividing by zero
     return np.clip((x - low) / max(high - low, ZERO_SAFETY), 0.0, 1.0)
 
-
-
-def calculate_nsdf(
+def calculate_sdf(
     mesh: trimesh.Trimesh,
     *,
     rays: int = 24
@@ -53,16 +59,15 @@ def calculate_nsdf(
     
     CONE_DEGREES = 120.0
     sdf  = sdf120.compute_sdf(vertices, faces, rays=rays, cone_deg=CONE_DEGREES, postprocess=True)
-    if not np.isfinite(sdf).all():
-        sdf = inpaint_sdf_nans(mesh, sdf)
-        
-    # smooth_sdf = smooth_blend_sdf(mesh, sdf)
-    return log_remap(robust_norm01(sdf))
+    sdf = inpaint_sdf(mesh, sdf)
+    nsdf = robust_norm01(sdf)
+    smooth_sdf = smooth_blend_sdf(mesh, nsdf)
+    return smooth_sdf
 
 def gaussian_mixture(nsdf: np.ndarray, k: int):
     length = nsdf.shape[0]
     
-    if length == 0:
+    if length <= 1:
         return np.zeros((0, 1))
     
     clamped_components = int(min(k, length)) # Dont ask more gaussians than there are faces
@@ -76,9 +81,19 @@ def gaussian_mixture(nsdf: np.ndarray, k: int):
         random_state=0, # make the result deterministc
     ).fit(reshaped_nsdf)
     
+    single_gm = GaussianMixture(
+        n_components=1,
+        max_iter=200,
+        n_init=10,
+        random_state=0,
+    ).fit(reshaped_nsdf)
+    
+    bicK, bic1 = gm.bic(reshaped_nsdf), single_gm.bic(reshaped_nsdf)
+    bic_difference = bic1 - bicK
+    
     probabilities = np.clip(gm.predict_proba(reshaped_nsdf), 1e-12, 1.0) # (F, clamped_components)
     
-    return probabilities.astype(np.float64)
+    return probabilities.astype(np.float64), bic_difference
 
 def graph_cut(probabilities: np.ndarray, edges: np.ndarray, edge_weights: np.ndarray) -> np.ndarray:
     unary_cost = (1.0 - probabilities) # Graph cut measures in costs, so low is better.
@@ -93,7 +108,7 @@ def graph_cut(probabilities: np.ndarray, edges: np.ndarray, edge_weights: np.nda
     labels = gco.cut_general_graph(
         edges, # node adjacency indices
         edge_weights, # larger weight means please dont cut, smaller weight means its oke to cut
-        unary_cost,  # the cost to assign a certain label to a node
+        unary_cost * 0.5,  # the cost to assign a certain label to a node
         identity_penalty_matrix, # optional penaltiy to prevent certain faces from connecting (always 1.0 for this implementation)
         algorithm="expansion",
     )
@@ -183,35 +198,139 @@ def split_face_components(mesh: trimesh.Trimesh):
     # make submeshes
     out = []
     for comp in comps:
-        sub = mesh.submesh([comp], append=True, repair=False)
+        sub = mesh.submesh([comp], only_watertight=False, append=True, repair=False)
         out.append((sub, comp))
     
     return out
 
-def segment_per_components(mesh: trimesh.Trimesh):
-    face_count = len(mesh.faces)
-    global_labels = np.full(face_count, -1, np.int32)
-    global_nsdf   = np.zeros(face_count, np.float64)
+def islands_from_labels(mesh: trimesh.Trimesh, labels: np.ndarray):
+    """
+    Return (island_id_per_face, islands), where:
+      - island_id_per_face: np.ndarray[int] with component index for each face
+      - islands: List[np.ndarray[int]] of face indices per connected component
+    Faces are connected only if adjacent AND share the same label.
+    """
+    F = len(labels)
+    E = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+
+    # Keep only adjacency edges where labels match
+    same_label = labels[E[:, 0]] == labels[E[:, 1]]
+    E = E[same_label]
     
+    # Undirected graph over faces
+    rows = np.concatenate([E[:, 0], E[:, 1]])
+    cols = np.concatenate([E[:, 1], E[:, 0]])
+    data = np.ones(rows.size, dtype=np.uint8)
+    G = coo_matrix((data, (rows, cols)), shape=(F, F))
+
+    n_comp, island_id = connected_components(G, directed=False)
+    islands = [np.flatnonzero(island_id == i).astype(np.int64) for i in range(n_comp)]
+
+    return islands
+
+def segment_per_components(
+    mesh: trimesh.Trimesh,
+    face_directions: np.ndarray
+):
+    face_count = len(mesh.faces)
+    global_nsdf   = np.zeros(face_count, np.float64)
+
     parts = split_face_components(mesh)
     
-    for part_index, (sub, orig_idx) in enumerate(parts):
+    for _, (sub, face_idx) in enumerate(parts):
         if sub.faces.shape[0] <= 1: 
             continue
         
+        sdf = calculate_sdf(sub)
+        global_nsdf[face_idx] = sdf
+    
+    global_labels = np.full(face_count, -1, np.int32)
+    offset = 0
+    for _, (sub, face_idx) in enumerate(parts):
+        sub_labels = recursive_labeling(
+            mesh,
+            sub, 
+            global_nsdf,
+            face_directions,
+            face_idx,
+        )
         
+        if sub_labels.size and sub_labels.max() >= 0:
+            global_labels[face_idx] = sub_labels + offset
+            offset += int(sub_labels.max() + 1)
+        else:
+            global_labels[face_idx] = offset
+            offset += 1
+    
+    _, remap = np.unique(global_labels, return_inverse=True)
+    global_labels = remap.astype(np.int32)
+    return global_labels, global_nsdf
 
+def recursive_labeling(
+    original_mesh: trimesh.Trimesh,
+    mesh: trimesh.Trimesh,
+    nsdf: np.ndarray,
+    face_directions: np.ndarray,
+    face_idx: np.ndarray,
+    current_depth: int = 0
+) -> np.ndarray:
+    MIN_FACES = 50
+    MAX_DEPTH = 3
+    
+    if face_idx.size == 0:
+        return np.zeros(0, np.int32)
+    
+    if (current_depth >= MAX_DEPTH or face_idx.size <= MIN_FACES):
+        return np.zeros(face_idx.size, np.int32)  # TODO should not be zero, should be merged into surrounding labels
+
+    sub_nsdf = nsdf[face_idx]
+    sub_face_directions = face_directions[face_idx]
+    edges = face_adjacency(mesh)
+    edge_weights = calculate_edge_weights(mesh, sub_face_directions)
+    probs, bic_difference = gaussian_mixture(sub_nsdf, 2)
+    
+    if bic_difference < 500:
+        return np.zeros(face_idx.size, np.int32)
+    
+    labels = graph_cut(probs, edges, edge_weights)
+    
+    islands = islands_from_labels(mesh, labels)
+    
+    out = -np.ones(face_idx.size, np.int32)
+    next_label = 0
+    for island in islands:
+        island_face_idx = face_idx[island]
+        sub = original_mesh.submesh([island_face_idx], only_watertight=False, append=True, repair=False)
+        
+        sub_labels = recursive_labeling(
+            original_mesh,
+            sub, 
+            nsdf, 
+            face_directions, 
+            island_face_idx,
+            current_depth+1
+        )
+        
+        if sub_labels.max() <= 0:
+            out[island] = next_label
+            next_label += 1
+        else:
+            out[island] = sub_labels + next_label
+            next_label += int(sub_labels.max() + 1)
+    
+    _, remap = np.unique(out, return_inverse=True)
+    return remap.astype(np.int32)
+        
+    
 def show_viewer(
     mesh: trimesh.Trimesh,
     sdf: np.ndarray,
-    probabilities: np.ndarray,
     labels: np.ndarray,
     face_directions: np.ndarray,
 ):
     label_colors = labels_to_colors(labels)
     sdf_colors = sdf_to_colors(sdf)
-    prob_colors = label_probs_to_colors(probabilities, gamma_correct=True)
-    
+
     def pr_from_colors(colors):
         m = mesh.copy(); 
         m.visual = trimesh.visual.ColorVisuals(mesh=mesh, face_colors=colors)
@@ -219,7 +338,6 @@ def show_viewer(
     
     # Different visualizations
     pr_sdf = pr_from_colors(sdf_colors)
-    pr_probs = pr_from_colors(prob_colors)
     pr_labels = pr_from_colors(label_colors)
     
     pr_curvline = curvature_direction_lines(mesh, face_directions, scale=0.6, every=3, color=(1,0,0,1))
@@ -237,7 +355,6 @@ def show_viewer(
     # view modes can be one or multiple nodes
     modes = {
         'sdf'       : [pr_sdf],
-        'probs'     : [pr_probs],
         'labels'    : [pr_labels],
         'curv_lines': [pr_sdf, pr_curvline],   # overlay lines on SDF (pick any base)
     }
@@ -261,7 +378,6 @@ def show_viewer(
     root.title("Viewer mode")
 
     tk.Button(root, text="Show SDF", command=lambda: switch('sdf')).pack(fill='x', padx=10, pady=6)
-    tk.Button(root, text="Show Label Probs", command=lambda: switch('probs')).pack(fill='x', padx=10, pady=6)
     tk.Button(root, text="Show Labels", command=lambda: switch('labels')).pack(fill='x', padx=10, pady=6)
     tk.Button(root, text="Curv Lines", command=lambda: switch('curv_lines')).pack(fill='x', padx=10, pady=6)
      
@@ -275,14 +391,16 @@ def main():
     mesh = load_mesh(args.input)
     
     face_directions = calculate_face_directions(mesh)
-    nsdf = calculate_nsdf(mesh)
-    probs = gaussian_mixture(nsdf, 3)
-    edges = face_adjacency(mesh)
-    edge_weights = calculate_edge_weights(mesh, face_directions)
+    labels, nsdf = segment_per_components(mesh, face_directions)
     
-    labels = graph_cut(probs, edges, edge_weights)
     
-    show_viewer(mesh, nsdf, probs, labels, face_directions)
+    #nsdf = calculate_nsdf(mesh)
+    #edge_weights = calculate_edge_weights(mesh, face_directions)
+    #probs = gaussian_mixture(nsdf, 2)
+    #edges = face_adjacency(mesh)
+    #labels = graph_cut(probs, edges, edge_weights)
+    #islands = islands_from_labels(mesh, labels)
+    show_viewer(mesh, nsdf, labels, face_directions)
 
 if __name__ == "__main__":
     main()

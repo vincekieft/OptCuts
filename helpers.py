@@ -264,7 +264,7 @@ def face_laplacian(mesh: trimesh.Trimesh,
 # ---------- main smoother/blender ----------
 def smooth_blend_sdf(mesh: trimesh.Trimesh, sdf: np.ndarray,
                      *,
-                     smooth_time=40.0,
+                     smooth_time=24.0,
                      sigma_angle_deg=40.0,
                      theta_stop_deg=85.0,
                      edge_len_power=2,
@@ -374,35 +374,74 @@ def calculate_face_directions(mesh, mode="min", radius=10) -> np.ndarray:
 
     return d
 
-def inpaint_sdf_nans(mesh, sdf, *, smooth_time=40.0,
-                     sigma_angle_deg=40.0, theta_stop_deg=85.0, edge_len_power=2):
+def inpaint_sdf(
+    mesh,
+    sdf,
+    *,
+    smooth_time=40.0,
+    sigma_angle_deg=40.0,
+    theta_stop_deg=85.0,
+    edge_len_power=2,
+    invalid_mask=None,
+    sentinel=None,          # e.g., -1.0
+    nonpos_as_missing=True,
+    eps=1e-12,
+):
     """
-    Fill NaNs in 'sdf' by solving (C + t L) x = C s0 over faces.
-    C=1 for valid faces, 0 for NaN faces. Tiny ridge added for SPD.
+    Inpaint missing SDF values over faces. Ensures non-negative output.
+
+    - Treats NaN/Inf as missing.
+    - If nonpos_as_missing=True, also treats values <= 0 (+/- eps) as missing.
+    - If sentinel is given, values close to it are treated as missing.
+    - After solve, clamps to >= 0 and restores original valid anchors.
     """
-    s = np.asarray(sdf, np.float64)
+    s = np.asarray(sdf, np.float64).copy()
     F = int(len(mesh.faces))
-    if F == 0 or not np.isnan(s).any():
-        return np.nan_to_num(s, nan=0.0)
+    if F == 0:
+        return np.zeros_like(s, dtype=np.float64)
 
-    # confidence: valid faces anchor the solution
-    valid = np.isfinite(s)
-    conf  = valid.astype(np.float64)
-    conf = np.maximum(conf, 1e-8)         # floor to keep matrix invertible
+    # Missing mask
+    if invalid_mask is None:
+        missing = ~np.isfinite(s)
+        if sentinel is not None:
+            missing |= np.isclose(s, sentinel)
+    else:
+        missing = np.asarray(invalid_mask, dtype=bool) | (~np.isfinite(s))
 
-    # neutral value for unknowns = median of knowns
-    base = float(np.nanmedian(s)) if np.isfinite(np.nanmedian(s)) else 0.0
-    s0   = np.where(valid, s, base)
+    if nonpos_as_missing:
+        missing |= (s <= eps)  # treat non-positive (or tiny) as missing
 
-    # face Laplacian you already have
+    valid = ~missing
+
+    if not valid.any():
+        return np.zeros_like(s, dtype=np.float64)
+
+    # Base from positive known values only
+    pos_known = s[valid & (s > eps)]
+    base = float(np.median(pos_known)) if pos_known.size else 0.0
+
+    # Initialize unknowns to base
+    s0 = np.where(valid, s, base)
+
+    # Confidence: anchor known faces; tiny ridge to keep SPD
+    conf = np.maximum(valid.astype(np.float64), 1e-8)
+
+    # Face Laplacian (yours)
     L = face_laplacian(mesh, sigma_angle_deg, theta_stop_deg, edge_len_power).tocsr()
 
     C = sp.diags(conf)
-    A = C + smooth_time * L + 1e-8 * sp.eye(F, format='csr')   # ridge for SPD
+    A = C + smooth_time * L + 1e-8 * sp.eye(F, format="csr")
     b = C @ s0
 
     try:
         x = spla.spsolve(A, b)
     except Exception:
         x, _ = spla.cg(A, b, tol=1e-10, maxiter=2000)
-    return np.asarray(x, dtype=np.float64)
+
+    x = np.asarray(x, dtype=np.float64)
+
+    # Enforce non-negativity and restore original anchors exactly
+    x = np.maximum(x, 0.0)
+    x[valid] = s[valid]
+
+    return x
